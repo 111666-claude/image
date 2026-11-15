@@ -19,20 +19,53 @@ const (
 	leHeader = "II\x2A\x00" // Header for little-endian files.
 	beHeader = "MM\x00\x2A" // Header for big-endian files.
 
-	ifdLen = 12 // Length of an IFD entry in bytes.
+	// BigTIFF (version 43) headers. They differ from the classic headers in
+	// the version field only, but BigTIFF files have 8-byte offsets and
+	// 20-byte IFD entries.
+	leBigHeader = "II\x2B\x00" // Header for little-endian BigTIFF files.
+	beBigHeader = "MM\x00\x2B" // Header for big-endian BigTIFF files.
+
+	ifdLen    = 12 // Length of a classic TIFF IFD entry in bytes.
+	ifdBigLen = 20 // Length of a BigTIFF IFD entry in bytes.
+
+	versionClassic = 42 // TIFF version in the header of a classic TIFF file.
+	versionBig     = 43 // TIFF version in the header of a BigTIFF file.
+
+	// maxIFDEntries bounds the number of entries in an IFD. IFD tags are
+	// 16-bit values that must be stored in strictly ascending order, so a
+	// valid IFD cannot contain more entries than the tag space allows.
+	maxIFDEntries = 1 << 16
 )
 
-// Data types (p. 14-16 of the spec).
+// Data types (p. 14-16 of the spec, plus the BigTIFF additions).
 const (
 	dtByte     = 1
 	dtASCII    = 2
 	dtShort    = 3
 	dtLong     = 4
 	dtRational = 5
+
+	// BigTIFF data types. They are 64-bit values; they can be used for
+	// values such as StripOffsets, TileOffsets and IFD offsets.
+	dtLong8  = 16
+	dtSLong8 = 17
+	dtIFD8   = 18
 )
 
-// The length of one instance of each data type in bytes.
+// The length of one instance of each classic data type in bytes.
 var lengths = [...]uint32{0, 1, 1, 2, 4, 8}
+
+// datatypeLen returns the length in bytes of one instance of the given IFD
+// data type. It reports whether the data type is one this package understands.
+func datatypeLen(datatype uint16) (uint32, bool) {
+	switch datatype {
+	case dtByte, dtASCII, dtShort, dtLong, dtRational:
+		return lengths[datatype], true
+	case dtLong8, dtSLong8, dtIFD8:
+		return 8, true
+	}
+	return 0, false
+}
 
 // Tags (see p. 28-41 of the spec).
 const (

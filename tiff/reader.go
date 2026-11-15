@@ -5,6 +5,10 @@
 // Package tiff implements a TIFF image decoder and encoder.
 //
 // The TIFF specification is at http://partners.adobe.com/public/developer/en/tiff/TIFF6.pdf
+//
+// The decoder also accepts BigTIFF files, which extend TIFF with 64-bit
+// offsets and larger IFD entries so that images larger than 4 GiB can be
+// addressed. BigTIFF is described at https://bigtiff.org/.
 package tiff // import "golang.org/x/image/tiff"
 
 import (
@@ -95,13 +99,25 @@ type decoder struct {
 	mode      imageMode
 	bpp       uint
 	features  map[int][]uint
-	ifd       map[int][ifdLen]byte
+	ifd       map[int][]byte
 	palette   []color.Color
+
+	// bigTiff reports whether this is a BigTIFF (version 43) file, which
+	// uses 8-byte offsets and 20-byte IFD entries.
+	bigTiff bool
 
 	buf   []byte
 	off   int    // Current offset in buf.
 	v     uint32 // Buffer value for reading with arbitrary bit depths.
 	nbits uint   // Remaining number of bits in v.
+}
+
+// entryLen returns the length in bytes of one IFD entry.
+func (d *decoder) entryLen() int {
+	if d.bigTiff {
+		return ifdBigLen
+	}
+	return ifdLen
 }
 
 // firstVal returns the first uint of the features entry with the given tag,
@@ -125,39 +141,108 @@ func (d *decoder) firstIntVal(tag int) (int, error) {
 	return int(v), nil
 }
 
-// ifdUint decodes the IFD entry in p, which must be of the Byte, Short
-// or Long type, and returns the decoded uint values.
+// ifdEntryData locates the data of the IFD entry in p. The entry must be a
+// complete IFD entry (12 bytes for classic TIFF, 20 bytes for BigTIFF).
+//
+// It returns the raw bytes holding at most maxCount values, the entry's
+// datatype and the number of values included in the returned slice. If the
+// entry declares more than maxCount values, only the first maxCount are
+// returned; this bounds the amount of work (and memory) that untrusted input
+// can cause.
+func (d *decoder) ifdEntryData(p []byte, maxCount int) (raw []byte, datatype uint16, count int, err error) {
+	entryLen := d.entryLen()
+	if len(p) < entryLen {
+		return nil, 0, 0, FormatError("bad IFD entry")
+	}
+
+	datatype = d.byteOrder.Uint16(p[2:4])
+	length := uint64(0)
+	if l, ok := datatypeLen(datatype); ok {
+		if !d.bigTiff && datatype > dtRational {
+			// LONG8, SLONG8 and IFD8 are BigTIFF-only data types.
+			return nil, 0, 0, UnsupportedError("IFD entry datatype")
+		}
+		length = uint64(l)
+	} else {
+		return nil, 0, 0, UnsupportedError("IFD entry datatype")
+	}
+
+	// The number of values is a uint32 in classic TIFF and a uint64 in
+	// BigTIFF. Reject counts whose total size would overflow; this also keeps
+	// the count within the bounds checked below.
+	var n uint64
+	if d.bigTiff {
+		n = d.byteOrder.Uint64(p[4:12])
+	} else {
+		n = uint64(d.byteOrder.Uint32(p[4:8]))
+	}
+	if n > math.MaxInt32/length {
+		return nil, 0, 0, FormatError("IFD data too large")
+	}
+	datalen := n * length
+
+	// The value is stored inline if it fits in the entry's value field, and
+	// is otherwise stored elsewhere and referenced by offset. BigTIFF has an
+	// 8-byte value field; classic TIFF has a 4-byte one.
+	inlineLen, valueOff := uint64(4), 8
+	if d.bigTiff {
+		inlineLen, valueOff = 8, 12
+	}
+
+	// Make sure the entry is long enough to contain the value field. This is
+	// redundant with the length check at the top of the function, but makes
+	// the slice expressions below obviously safe.
+	if len(p) < valueOff+int(inlineLen) {
+		return nil, 0, 0, FormatError("bad IFD entry")
+	}
+
+	truncatedCount := int(n)
+	if truncatedCount > maxCount {
+		truncatedCount = maxCount
+	}
+	truncatedLen := uint64(truncatedCount) * length
+
+	if datalen > inlineLen {
+		off := d.ifdValueOffset(p, valueOff)
+		if d.bigTiff && off%8 != 0 {
+			// The BigTIFF specification requires all values to begin at an
+			// 8-byte-aligned address.
+			return nil, 0, 0, FormatError("misaligned IFD value offset")
+		}
+		if off > math.MaxInt64 {
+			return nil, 0, 0, FormatError("IFD value offset too large")
+		}
+		raw, err = safeReadAt(d.r, truncatedLen, int64(off))
+		if err != nil {
+			return nil, 0, 0, err
+		}
+	} else {
+		raw = p[valueOff : valueOff+int(datalen)]
+	}
+	return raw, datatype, truncatedCount, nil
+}
+
+// ifdValueOffset returns the value-or-offset field of the IFD entry in p.
+// off is the offset of that field within the entry.
+func (d *decoder) ifdValueOffset(p []byte, off int) uint64 {
+	if d.bigTiff {
+		return d.byteOrder.Uint64(p[off : off+8])
+	}
+	return uint64(d.byteOrder.Uint32(p[off : off+4]))
+}
+
+// ifdUint decodes the IFD entry in p, which must be of the Byte, Short,
+// Long, Long8 or IFD8 type, and returns the decoded uint values.
 //
 // maxCount limits the number of values.
 // If the entry contains more than maxCount values, only the first maxCount are parsed.
 func (d *decoder) ifdUint(p []byte, maxCount int) (u []uint, err error) {
-	var raw []byte
-	if len(p) < ifdLen {
-		return nil, FormatError("bad IFD entry")
-	}
-
-	datatype := d.byteOrder.Uint16(p[2:4])
-	if dt := int(datatype); dt <= 0 || dt >= len(lengths) {
-		return nil, UnsupportedError("IFD entry datatype")
-	}
-
-	count := d.byteOrder.Uint32(p[4:8])
-	if count > math.MaxInt32/lengths[datatype] {
-		return nil, FormatError("IFD data too large")
-	}
-	truncatedCount := min(int(count), maxCount)
-	if datalen := lengths[datatype] * count; datalen > 4 {
-		truncatedLen := uint64(lengths[datatype]) * uint64(truncatedCount)
-		// The IFD contains a pointer to the real value.
-		raw, err = safeReadAt(d.r, truncatedLen, int64(d.byteOrder.Uint32(p[8:12])))
-	} else {
-		raw = p[8 : 8+datalen]
-	}
+	raw, datatype, count, err := d.ifdEntryData(p, maxCount)
 	if err != nil {
 		return nil, err
 	}
 
-	u = make([]uint, truncatedCount)
+	u = make([]uint, count)
 	switch datatype {
 	case dtByte:
 		for i := range u {
@@ -171,6 +256,16 @@ func (d *decoder) ifdUint(p []byte, maxCount int) (u []uint, err error) {
 		for i := range u {
 			u[i] = uint(d.byteOrder.Uint32(raw[4*i : 4*(i+1)]))
 		}
+	case dtLong8, dtIFD8:
+		for i := range u {
+			v := d.byteOrder.Uint64(raw[8*i : 8*(i+1)])
+			if v > math.MaxUint {
+				// The value cannot be represented as a uint, which is a
+				// possibility on 32-bit platforms.
+				return nil, FormatError("IFD value too large")
+			}
+			u[i] = uint(v)
+		}
 	default:
 		return nil, UnsupportedError("data type")
 	}
@@ -180,12 +275,45 @@ func (d *decoder) ifdUint(p []byte, maxCount int) (u []uint, err error) {
 // parseIFDOffsets parses an IFD entry stored in d.ifd using ifdUint.
 // For IFD entries which can be large, we delay reading and parsing the entry
 // until we know the image size, which lets us set reasonable bounds on the IFD entry.
-func (d *decoder) parseIFDOffsets(tag int, maxCount int) (u []uint, err error) {
+//
+// The offsets are returned as int64 so that files larger than 4 GiB can be
+// addressed on all platforms, including those where int is 32 bits wide.
+func (d *decoder) parseIFDOffsets(tag int, maxCount int) ([]int64, error) {
 	p, ok := d.ifd[tag]
 	if !ok {
 		return nil, nil
 	}
-	return d.ifdUint(p[:], maxCount)
+	raw, datatype, count, err := d.ifdEntryData(p, maxCount)
+	if err != nil {
+		return nil, err
+	}
+
+	u := make([]int64, count)
+	switch datatype {
+	case dtByte:
+		for i := range u {
+			u[i] = int64(raw[i])
+		}
+	case dtShort:
+		for i := range u {
+			u[i] = int64(d.byteOrder.Uint16(raw[2*i : 2*(i+1)]))
+		}
+	case dtLong:
+		for i := range u {
+			u[i] = int64(d.byteOrder.Uint32(raw[4*i : 4*(i+1)]))
+		}
+	case dtLong8, dtIFD8:
+		for i := range u {
+			v := d.byteOrder.Uint64(raw[8*i : 8*(i+1)])
+			if v > math.MaxInt64 {
+				return nil, FormatError("IFD offset too large")
+			}
+			u[i] = int64(v)
+		}
+	default:
+		return nil, UnsupportedError("data type")
+	}
+	return u, nil
 }
 
 // parseIFD decides whether the IFD entry in p is "interesting" and
@@ -227,8 +355,8 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tTileByteCounts:
 		// These keys may contain many values.
 		// Stash the IFD entry for later parsing.
-		var v [ifdLen]byte
-		copy(v[:], p)
+		v := make([]byte, len(p))
+		copy(v, p)
 		d.ifd[int(tag)] = v
 	case tColorMap:
 		const maxColors = 256
@@ -520,7 +648,7 @@ func newDecoder(r io.Reader) (*decoder, error) {
 	d := &decoder{
 		r:        newReaderAt(r),
 		features: make(map[int][]uint),
-		ifd:      make(map[int][ifdLen]byte),
+		ifd:      make(map[int][]byte),
 	}
 
 	p := make([]byte, 8)
@@ -535,28 +663,80 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		d.byteOrder = binary.LittleEndian
 	case beHeader:
 		d.byteOrder = binary.BigEndian
+	case leBigHeader:
+		d.byteOrder = binary.LittleEndian
+		d.bigTiff = true
+	case beBigHeader:
+		d.byteOrder = binary.BigEndian
+		d.bigTiff = true
 	default:
 		return nil, FormatError("malformed header")
 	}
 
-	ifdOffset := int64(d.byteOrder.Uint32(p[4:8]))
+	var ifdOffset int64
+	headerLen := int64(8)
+	if d.bigTiff {
+		// A BigTIFF header is 16 bytes long: bytes 4-5 contain the width of
+		// offsets, bytes 6-7 are reserved, and bytes 8-15 contain the 8-byte
+		// offset of the first IFD.
+		headerLen = 16
+		p, err := safeReadAt(d.r, 16, 0)
+		if err != nil {
+			return nil, err
+		}
+		if offsetSize := d.byteOrder.Uint16(p[4:6]); offsetSize != 8 {
+			return nil, UnsupportedError(fmt.Sprintf("BigTIFF offset size %d", offsetSize))
+		}
+		if reserved := d.byteOrder.Uint16(p[6:8]); reserved != 0 {
+			return nil, FormatError("non-zero reserved header field")
+		}
+		off := d.byteOrder.Uint64(p[8:16])
+		if off > math.MaxInt64 {
+			return nil, FormatError("IFD offset too large")
+		}
+		ifdOffset = int64(off)
+	} else {
+		ifdOffset = int64(d.byteOrder.Uint32(p[4:8]))
+	}
+	if ifdOffset < headerLen || ifdOffset > math.MaxInt64-8 {
+		// The IFD cannot overlap the file header, and adding the size of the
+		// entry count must not overflow.
+		return nil, FormatError("bad IFD offset")
+	}
 
-	// The first two bytes contain the number of entries (12 bytes each).
-	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
+	// The first entry (2 bytes in classic TIFF, 8 bytes in BigTIFF) contains
+	// the number of entries (12 bytes each in classic TIFF, 20 bytes each in
+	// BigTIFF).
+	entryLen := d.entryLen()
+	countLen := int64(2)
+	if d.bigTiff {
+		countLen = 8
+	}
+	p, err := safeReadAt(d.r, uint64(countLen), ifdOffset)
+	if err != nil {
 		return nil, err
 	}
-	numItems := int(d.byteOrder.Uint16(p[0:2]))
+	var numItems int64
+	if d.bigTiff {
+		v := d.byteOrder.Uint64(p[0:8])
+		if v > maxIFDEntries {
+			return nil, FormatError("too many IFD entries")
+		}
+		numItems = int64(v)
+	} else {
+		numItems = int64(d.byteOrder.Uint16(p[0:2]))
+	}
 
-	// All IFD entries are read in one chunk.
-	var err error
-	p, err = safeReadAt(d.r, uint64(ifdLen*numItems), ifdOffset+2)
+	// All IFD entries are read in one chunk. The bounds on numItems and
+	// entryLen keep the multiplication from overflowing.
+	p, err = safeReadAt(d.r, uint64(entryLen)*uint64(numItems), ifdOffset+countLen)
 	if err != nil {
 		return nil, err
 	}
 
 	prevTag := -1
-	for i := 0; i < len(p); i += ifdLen {
-		tag, err := d.parseIFD(p[i : i+ifdLen])
+	for i := 0; i < len(p); i += entryLen {
+		tag, err := d.parseIFD(p[i : i+entryLen])
 		if err != nil {
 			return nil, err
 		}
@@ -715,7 +895,7 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		blocksDown = 0
 	}
 
-	var blockOffsets, blockCounts []uint
+	var blockOffsets, blockCounts []int64
 
 	if d.firstVal(tTileWidth) != 0 {
 		blockPadding = true
@@ -838,8 +1018,8 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			if !blockPadding && j == blocksDown-1 && d.config.Height%blockHeight != 0 {
 				blkH = d.config.Height % blockHeight
 			}
-			offset := int64(blockOffsets[j*blocksAcross+i])
-			n := int64(blockCounts[j*blocksAcross+i])
+			offset := blockOffsets[j*blocksAcross+i]
+			n := blockCounts[j*blocksAcross+i]
 			switch d.firstVal(tCompression) {
 
 			// According to the spec, Compression does not have a default value,
@@ -907,4 +1087,6 @@ func readBuf(r io.Reader, buf []byte, lim int64) ([]byte, error) {
 func init() {
 	image.RegisterFormat("tiff", leHeader, Decode, DecodeConfig)
 	image.RegisterFormat("tiff", beHeader, Decode, DecodeConfig)
+	image.RegisterFormat("tiff", leBigHeader, Decode, DecodeConfig)
+	image.RegisterFormat("tiff", beBigHeader, Decode, DecodeConfig)
 }
