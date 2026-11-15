@@ -98,6 +98,12 @@ type decoder struct {
 	ifd       map[int][ifdLen]byte
 	palette   []color.Color
 
+	// blockPadding reports whether the image is divided into tiles.
+	// Tiles are padded to a multiple of 16 pixels in both dimensions,
+	// so the rows of a tile can contain horizontal padding past the edge
+	// of the image that must be skipped when decoding.
+	blockPadding bool
+
 	buf   []byte
 	off   int    // Current offset in buf.
 	v     uint32 // Buffer value for reading with arbitrary bit depths.
@@ -360,13 +366,17 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					}
 					img.SetGray16(x, y, color.Gray16{v})
 				}
-				if rMaxX == img.Bounds().Max.X {
-					d.off += 2 * (xmax - img.Bounds().Max.X)
+				// Skip the horizontal padding at the end of a tile row.
+				if d.blockPadding && rMaxX == img.Bounds().Max.X {
+					d.off += 2 * (xmax - rMaxX)
 				}
 			}
 		} else {
 			img := dst.(*image.Gray)
 			max := uint32((1 << d.bpp) - 1)
+			// Each row of a tile is byte-aligned, so sub-byte samples can
+			// leave padding bits at the end of the row.
+			rowBytes := ((xmax-xmin)*int(d.bpp) + 7) / 8
 			for y := ymin; y < rMaxY; y++ {
 				for x := xmin; x < rMaxX; x++ {
 					v, ok := d.readBits(d.bpp)
@@ -380,11 +390,22 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					img.SetGray(x, y, color.Gray{uint8(v)})
 				}
 				d.flushBits()
+				// Skip the horizontal padding at the end of a tile row.
+				if d.blockPadding && rMaxX == img.Bounds().Max.X {
+					wantOff := (y - ymin + 1) * rowBytes
+					if wantOff > len(d.buf) {
+						return errNoPixels
+					}
+					d.off = wantOff
+				}
 			}
 		}
 	case mPaletted:
 		img := dst.(*image.Paletted)
 		pLen := len(d.palette)
+		// Each row of a tile is byte-aligned, so sub-byte samples can
+		// leave padding bits at the end of the row.
+		rowBytes := ((xmax-xmin)*int(d.bpp) + 7) / 8
 		for y := ymin; y < rMaxY; y++ {
 			for x := xmin; x < rMaxX; x++ {
 				v, ok := d.readBits(d.bpp)
@@ -398,6 +419,14 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				img.SetColorIndex(x, y, idx)
 			}
 			d.flushBits()
+			// Skip the horizontal padding at the end of a tile row.
+			if d.blockPadding && rMaxX == img.Bounds().Max.X {
+				wantOff := (y - ymin + 1) * rowBytes
+				if wantOff > len(d.buf) {
+					return errNoPixels
+				}
+				d.off = wantOff
+			}
 		}
 	case mRGB:
 		if d.bpp == 16 {
@@ -412,6 +441,10 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
 					d.off += 6
 					img.SetRGBA64(x, y, color.RGBA64{r, g, b, 0xffff})
+				}
+				// Skip the horizontal padding at the end of a tile row.
+				if d.blockPadding && rMaxX == img.Bounds().Max.X {
+					d.off += 6 * (xmax - rMaxX)
 				}
 			}
 		} else {
@@ -447,6 +480,10 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					d.off += 8
 					img.SetNRGBA64(x, y, color.NRGBA64{r, g, b, a})
 				}
+				// Skip the horizontal padding at the end of a tile row.
+				if d.blockPadding && rMaxX == img.Bounds().Max.X {
+					d.off += 8 * (xmax - rMaxX)
+				}
 			}
 		} else {
 			img := dst.(*image.NRGBA)
@@ -474,6 +511,10 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					a := d.byteOrder.Uint16(d.buf[d.off+6 : d.off+8])
 					d.off += 8
 					img.SetRGBA64(x, y, color.RGBA64{r, g, b, a})
+				}
+				// Skip the horizontal padding at the end of a tile row.
+				if d.blockPadding && rMaxX == img.Bounds().Max.X {
+					d.off += 8 * (xmax - rMaxX)
 				}
 			}
 		} else {
@@ -683,7 +724,6 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		return
 	}
 
-	blockPadding := false
 	blockWidth := d.config.Width
 	blockHeight := d.config.Height
 	blocksAcross := 1
@@ -699,7 +739,7 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	var blockOffsets, blockCounts []uint
 
 	if d.firstVal(tTileWidth) != 0 {
-		blockPadding = true
+		d.blockPadding = true
 
 		if blockWidth, err = d.firstIntVal(tTileWidth); err != nil {
 			return nil, err
@@ -811,12 +851,12 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	blockMaxDataSize := int64(blockWidth) * int64(blockHeight) * 8
 	for i := 0; i < blocksAcross; i++ {
 		blkW := blockWidth
-		if !blockPadding && i == blocksAcross-1 && d.config.Width%blockWidth != 0 {
+		if !d.blockPadding && i == blocksAcross-1 && d.config.Width%blockWidth != 0 {
 			blkW = d.config.Width % blockWidth
 		}
 		for j := 0; j < blocksDown; j++ {
 			blkH := blockHeight
-			if !blockPadding && j == blocksDown-1 && d.config.Height%blockHeight != 0 {
+			if !d.blockPadding && j == blocksDown-1 && d.config.Height%blockHeight != 0 {
 				blkH = d.config.Height % blockHeight
 			}
 			offset := int64(blockOffsets[j*blocksAcross+i])
