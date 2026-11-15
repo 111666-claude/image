@@ -102,6 +102,13 @@ type decoder struct {
 	off   int    // Current offset in buf.
 	v     uint32 // Buffer value for reading with arbitrary bit depths.
 	nbits uint   // Remaining number of bits in v.
+
+	// copyBlocks makes decodeImage copy uncompressed block data instead of
+	// using a slice of the underlying reader's buffer. The horizontal
+	// predictor is applied in place, so decoding an aliased slice would
+	// otherwise modify the input (and corrupt later reads of the same
+	// buffer). It is set when a page is decoded through a Reader.
+	copyBlocks bool
 }
 
 // firstVal returns the first uint of the features entry with the given tag,
@@ -516,36 +523,58 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 // used for conservative bounds checking.
 const maxBytesPerPixel = 8
 
+// readHeader reads the 8 byte TIFF header from r, returning the file's byte
+// order and the offset of the first IFD.
+func readHeader(r io.ReaderAt) (binary.ByteOrder, int64, error) {
+	p := make([]byte, 8)
+	if _, err := r.ReadAt(p, 0); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, 0, err
+	}
+	var byteOrder binary.ByteOrder
+	switch string(p[0:4]) {
+	case leHeader:
+		byteOrder = binary.LittleEndian
+	case beHeader:
+		byteOrder = binary.BigEndian
+	default:
+		return nil, 0, FormatError("malformed header")
+	}
+	return byteOrder, int64(byteOrder.Uint32(p[4:8])), nil
+}
+
+// newDecoder returns a decoder for the first image (page) of the TIFF stream
+// read from r.
 func newDecoder(r io.Reader) (*decoder, error) {
+	ra := newReaderAt(r)
+	byteOrder, ifdOffset, err := readHeader(ra)
+	if err != nil {
+		return nil, err
+	}
+	return newPageDecoder(ra, byteOrder, ifdOffset)
+}
+
+// newPageDecoder returns a decoder for the single image described by the IFD
+// at ifdOffset.
+func newPageDecoder(r io.ReaderAt, byteOrder binary.ByteOrder, ifdOffset int64) (*decoder, error) {
 	d := &decoder{
-		r:        newReaderAt(r),
-		features: make(map[int][]uint),
-		ifd:      make(map[int][ifdLen]byte),
+		r:         r,
+		byteOrder: byteOrder,
+		features:  make(map[int][]uint),
+		ifd:       make(map[int][ifdLen]byte),
 	}
 
-	p := make([]byte, 8)
-	if _, err := d.r.ReadAt(p, 0); err != nil {
+	// The first two bytes contain the number of entries (12 bytes each).
+	p := make([]byte, 2)
+	if _, err := d.r.ReadAt(p, ifdOffset); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return nil, err
 	}
-	switch string(p[0:4]) {
-	case leHeader:
-		d.byteOrder = binary.LittleEndian
-	case beHeader:
-		d.byteOrder = binary.BigEndian
-	default:
-		return nil, FormatError("malformed header")
-	}
-
-	ifdOffset := int64(d.byteOrder.Uint32(p[4:8]))
-
-	// The first two bytes contain the number of entries (12 bytes each).
-	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
-		return nil, err
-	}
-	numItems := int(d.byteOrder.Uint16(p[0:2]))
+	numItems := int(d.byteOrder.Uint16(p))
 
 	// All IFD entries are read in one chunk.
 	var err error
@@ -679,6 +708,9 @@ func newDecoder(r io.Reader) (*decoder, error) {
 
 // DecodeConfig returns the color model and dimensions of a TIFF image without
 // decoding the entire image.
+//
+// DecodeConfig describes only the first page of a multi-page TIFF. Use
+// NewReader and Reader.PageConfig to describe other pages.
 func DecodeConfig(r io.Reader) (image.Config, error) {
 	d, err := newDecoder(r)
 	if err != nil {
@@ -696,12 +728,19 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 
 // Decode reads a TIFF image from r and returns it as an image.Image.
 // The type of Image returned depends on the contents of the TIFF.
-func Decode(r io.Reader) (img image.Image, err error) {
+//
+// Decode reads only the first page of a multi-page TIFF. Use NewReader and
+// Reader.DecodePage to read other pages.
+func Decode(r io.Reader) (image.Image, error) {
 	d, err := newDecoder(r)
 	if err != nil {
-		return
+		return nil, err
 	}
+	return d.decodeImage()
+}
 
+// decodeImage decodes the image described by d's IFD.
+func (d *decoder) decodeImage() (img image.Image, err error) {
 	blockPadding := false
 	blockWidth := d.config.Width
 	blockHeight := d.config.Height
@@ -849,7 +888,7 @@ func Decode(r io.Reader) (img image.Image, err error) {
 				if n > blockMaxDataSize {
 					return nil, FormatError("block data size too large")
 				}
-				if b, ok := d.r.(*buffer); ok {
+				if b, ok := d.r.(*buffer); ok && !d.copyBlocks {
 					d.buf, err = b.Slice(offset, n)
 				} else {
 					d.buf, err = safeReadAt(d.r, uint64(n), offset)
