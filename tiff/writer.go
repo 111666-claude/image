@@ -12,6 +12,8 @@ import (
 	"image"
 	"io"
 	"sort"
+
+	"golang.org/x/image/internal/safemath"
 )
 
 // The TIFF format allows to choose the order of the different elements freely.
@@ -221,6 +223,21 @@ func writePix(w io.Writer, pix []byte, nrows, length, stride int) error {
 	return nil
 }
 
+// pixelSize returns the number of bytes occupied by one pixel in the
+// uncompressed strip data that Encode writes for m.
+func pixelSize(m image.Image) int {
+	switch m.(type) {
+	case *image.Paletted, *image.Gray:
+		return 1
+	case *image.Gray16:
+		return 2
+	case *image.RGBA64, *image.NRGBA64:
+		return 8
+	default:
+		return 4
+	}
+}
+
 func writeIFD(w io.Writer, ifdOffset int, d []ifdEntry) error {
 	var buf [ifdLen]byte
 	// Make space for "pointer area" containing IFD entry data
@@ -292,8 +309,18 @@ type Options struct {
 func Encode(w io.Writer, m image.Image, opt *Options) error {
 	d := m.Bounds().Size()
 
+	if d.X < 0 || d.Y < 0 {
+		return errors.New("tiff: negative image dimensions")
+	}
 	if d.X == 0 || d.Y == 0 {
 		return errors.New("tiff: zero-size image")
+	}
+	// Check that the uncompressed pixel data fits in an int, mirroring the
+	// limit enforced by the decoder. Without this, an image whose reported
+	// dimensions overflow would get StripOffsets/ByteCounts that do not
+	// describe the data actually written.
+	if _, ok := safemath.Mul3(d.X, d.Y, maxBytesPerPixel); !ok {
+		return errors.New("tiff: image too large")
 	}
 
 	compression := uint32(cNone)
@@ -323,26 +350,17 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 	case cNone:
 		dst = w
 		// Write IFD offset before outputting pixel data.
-		switch m.(type) {
-		case *image.Paletted:
-			imageLen = d.X * d.Y * 1
-		case *image.Gray:
-			imageLen = d.X * d.Y * 1
-		case *image.Gray16:
-			imageLen = d.X * d.Y * 2
-		case *image.RGBA64:
-			imageLen = d.X * d.Y * 8
-		case *image.NRGBA64:
-			imageLen = d.X * d.Y * 8
-		default:
-			imageLen = d.X * d.Y * 4
-		}
+		imageLen = d.X * d.Y * pixelSize(m)
 		err = binary.Write(w, enc, uint32(imageLen+8))
 		if err != nil {
 			return err
 		}
 	case cDeflate:
 		dst = zlib.NewWriter(&buf)
+	case cPackBits:
+		// PackBits compresses each scanline independently, so the writer
+		// needs the uncompressed length of one row.
+		dst = newPackBitsWriter(&buf, d.X*pixelSize(m))
 	default:
 		return errors.New("tiff: unsupported compression")
 	}
