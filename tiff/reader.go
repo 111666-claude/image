@@ -16,6 +16,7 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"sort"
 
 	"golang.org/x/image/ccitt"
 	"golang.org/x/image/internal/safemath"
@@ -208,6 +209,7 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tPhotometricInterpretation,
 		tCompression,
 		tPredictor,
+		tPlanarConfiguration,
 		tRowsPerStrip,
 		tTileWidth,
 		tTileLength,
@@ -516,6 +518,158 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 // used for conservative bounds checking.
 const maxBytesPerPixel = 8
 
+// readPlanarBlock reads and decompresses a single strip of a planar-separate
+// component plane. Only uncompressed and LZW-compressed data are supported.
+// The decompressed size is bounded by lim bytes.
+func (d *decoder) readPlanarBlock(offset, n, lim int64) ([]byte, error) {
+	switch c := d.firstVal(tCompression); c {
+	// According to the spec, Compression does not have a default value,
+	// but some tools interpret a missing Compression value as none, so we do
+	// the same.
+	case cNone, 0:
+		if n > lim {
+			return nil, FormatError("block data size too large")
+		}
+		if b, ok := d.r.(*buffer); ok {
+			return b.Slice(offset, n)
+		}
+		return safeReadAt(d.r, uint64(n), offset)
+	case cLZW:
+		r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), lzw.MSB, 8)
+		buf, err := readBuf(r, d.buf[:0], lim)
+		r.Close()
+		return buf, err
+	default:
+		return nil, UnsupportedError(fmt.Sprintf("planar-separate configuration with compression value %d", c))
+	}
+}
+
+// decodePlanarStrips decodes an RGB image whose component planes are stored
+// separately (PlanarConfiguration = 2). blockOffsets and blockCounts hold the
+// strips of every plane in turn: all strips for the first component, then all
+// strips for the second component, and so on.
+func (d *decoder) decodePlanarStrips(dst image.Image, blockOffsets, blockCounts []uint, blocksDown, blockHeight int) error {
+	numSamples := len(d.features[tBitsPerSample])
+	if numSamples != 3 {
+		// newDecoder only selects planar mode for mRGB without extra samples.
+		return FormatError("planar-separate configuration requires exactly 3 samples per pixel")
+	}
+	if blocksDown <= 0 || len(blockOffsets) != blocksDown*numSamples || len(blockCounts) != blocksDown*numSamples {
+		return FormatError("inconsistent header: wrong number of planar strips")
+	}
+
+	width := d.config.Width
+	height := d.config.Height
+	bytesPerSample := int(d.bpp) / 8
+	// Strips of distinct planes and strips must not claim overlapping byte
+	// ranges. Overlapping ranges are at best ambiguous and can be used to make
+	// one logical image depend on another image's data.
+	type byteRange struct{ start, end int64 }
+	ranges := make([]byteRange, 0, len(blockOffsets))
+	for i, offU := range blockOffsets {
+		off := int64(offU)
+		n := int64(blockCounts[i])
+		if off < 0 || n < 0 {
+			return FormatError("invalid planar strip offset or byte count")
+		}
+		end := off + n
+		if end < off {
+			return FormatError("planar strip offset and byte count overflow")
+		}
+		ranges = append(ranges, byteRange{off, end})
+	}
+	sortedRanges := append([]byteRange(nil), ranges...)
+	sort.Slice(sortedRanges, func(i, j int) bool {
+		if sortedRanges[i].start != sortedRanges[j].start {
+			return sortedRanges[i].start < sortedRanges[j].start
+		}
+		return sortedRanges[i].end < sortedRanges[j].end
+	})
+	for i := 1; i < len(sortedRanges); i++ {
+		if sortedRanges[i].start < sortedRanges[i-1].end {
+			return FormatError("planar strip data ranges overlap")
+		}
+	}
+
+	// Initialize the alpha channel: planar RGB has no alpha component, so it
+	// is fully opaque everywhere. The component decoders only touch R, G and B.
+	switch img := dst.(type) {
+	case *image.RGBA:
+		for i := 3; i < len(img.Pix); i += 4 {
+			img.Pix[i] = 0xff
+		}
+	case *image.RGBA64:
+		for i := 8; i <= len(img.Pix); i += 8 {
+			img.Pix[i-2] = 0xff
+			img.Pix[i-1] = 0xff
+		}
+	default:
+		return FormatError("internal error: unexpected destination image type")
+	}
+
+	for plane := 0; plane < numSamples; plane++ {
+		d.buf = d.buf[:0]
+		for j := 0; j < blocksDown; j++ {
+			idx := plane*blocksDown + j
+			offset := int64(blockOffsets[idx])
+			n := int64(blockCounts[idx])
+
+			ymin := j * blockHeight
+			ymax := ymin + blockHeight
+			if ymax > height {
+				ymax = height
+			}
+			rows := ymax - ymin
+			// The final strip may contain fewer rows than RowsPerStrip;
+			// size its bound from the rows it actually covers.
+			stripMaxDataSize := int64(width) * int64(rows) * int64(bytesPerSample)
+			buf, err := d.readPlanarBlock(offset, n, stripMaxDataSize)
+			if err != nil {
+				return err
+			}
+
+			if err := d.decodePlanarComponent(dst, plane, buf, ymin, ymax); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// decodePlanarComponent writes one component plane from the (decompressed)
+// bytes of a single strip into dst. Rows ymin through ymax-1 are covered.
+func (d *decoder) decodePlanarComponent(dst image.Image, component int, buf []byte, ymin, ymax int) error {
+	width := d.config.Width
+	switch img := dst.(type) {
+	case *image.RGBA:
+		for y := ymin; y < ymax; y++ {
+			rowOff := (y - ymin) * width
+			if rowOff+width > len(buf) {
+				return errNoPixels
+			}
+			for x := 0; x < width; x++ {
+				img.Pix[img.PixOffset(x, y)+component] = buf[rowOff+x]
+			}
+		}
+	case *image.RGBA64:
+		for y := ymin; y < ymax; y++ {
+			rowOff := (y - ymin) * width * 2
+			for x := 0; x < width; x++ {
+				off := rowOff + 2*x
+				if off+2 > len(buf) {
+					return errNoPixels
+				}
+				v := d.byteOrder.Uint16(buf[off : off+2])
+				// *image.RGBA64 always stores samples in big-endian order.
+				binary.BigEndian.PutUint16(img.Pix[img.PixOffset(x, y)+2*component:], v)
+			}
+		}
+	default:
+		return FormatError("internal error: unexpected destination image type")
+	}
+	return nil
+}
+
 func newDecoder(r io.Reader) (*decoder, error) {
 	d := &decoder{
 		r:        newReaderAt(r),
@@ -674,6 +828,25 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		}
 	}
 
+	// PlanarConfiguration defaults to chunky (1) when absent, per the spec.
+	switch pc := d.firstVal(tPlanarConfiguration); pc {
+	case 0, pcChunky:
+		// Interleaved (chunky) data, handled by the regular decode path.
+	case pcPlanar:
+		// Planar-separate data is only supported for 8- and 16-bit RGB
+		// images without extra (alpha) samples. Tiles and compression
+		// other than none or LZW are rejected later, where those features
+		// are known.
+		if d.mode != mRGB || (d.bpp != 8 && d.bpp != 16) {
+			return nil, UnsupportedError("planar-separate configuration is only supported for 8-bit and 16-bit RGB images")
+		}
+		if d.firstVal(tPredictor) == prHorizontal {
+			return nil, UnsupportedError("planar-separate configuration with horizontal predictor")
+		}
+	default:
+		return nil, FormatError(fmt.Sprintf("invalid planar configuration %d", pc))
+	}
+
 	return d, nil
 }
 
@@ -716,6 +889,11 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	}
 
 	var blockOffsets, blockCounts []uint
+
+	planar := d.firstVal(tPlanarConfiguration) == pcPlanar
+	if planar && d.firstVal(tTileWidth) != 0 {
+		return nil, UnsupportedError("planar-separate configuration with tiles")
+	}
 
 	if d.firstVal(tTileWidth) != 0 {
 		blockPadding = true
@@ -784,18 +962,40 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			blocksDown = (d.config.Height + blockHeight - 1) / blockHeight
 		}
 
-		blockOffsets, err = d.parseIFDOffsets(tStripOffsets, blocksDown)
-		if err != nil {
-			return nil, err
-		}
-		blockCounts, err = d.parseIFDOffsets(tStripByteCounts, blocksDown)
-		if err != nil {
-			return nil, err
+		if planar {
+			// A planar-separate image stores one strip sequence per
+			// component plane, so every plane must contain exactly
+			// blocksDown strips. Parse one value more than the expected
+			// total to detect extraneous planes.
+			numSamples := len(d.features[tBitsPerSample])
+			maxCount := blocksDown*numSamples + 1
+			blockOffsets, err = d.parseIFDOffsets(tStripOffsets, maxCount)
+			if err != nil {
+				return nil, err
+			}
+			blockCounts, err = d.parseIFDOffsets(tStripByteCounts, maxCount)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			blockOffsets, err = d.parseIFDOffsets(tStripOffsets, blocksDown)
+			if err != nil {
+				return nil, err
+			}
+			blockCounts, err = d.parseIFDOffsets(tStripByteCounts, blocksDown)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	// Check if we have the right number of strips/tiles, offsets and counts.
-	if n := blocksAcross * blocksDown; len(blockOffsets) < n || len(blockCounts) < n {
+	if planar {
+		numSamples := len(d.features[tBitsPerSample])
+		if want := blocksDown * numSamples; len(blockOffsets) != want || len(blockCounts) != want {
+			return nil, FormatError("inconsistent header: wrong number of planar strips")
+		}
+	} else if n := blocksAcross * blocksDown; len(blockOffsets) < n || len(blockCounts) < n {
 		return nil, FormatError("inconsistent header")
 	}
 
@@ -826,6 +1026,14 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	if blocksAcross == 0 || blocksDown == 0 {
 		return
 	}
+
+	if planar {
+		if err := d.decodePlanarStrips(img, blockOffsets, blockCounts, blocksDown, blockHeight); err != nil {
+			return nil, err
+		}
+		return
+	}
+
 	// Maximum data per pixel is 8 bytes (RGBA64).
 	blockMaxDataSize := int64(blockWidth) * int64(blockHeight) * 8
 	for i := 0; i < blocksAcross; i++ {
