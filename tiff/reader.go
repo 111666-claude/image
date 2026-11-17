@@ -209,6 +209,7 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tCompression,
 		tPredictor,
 		tRowsPerStrip,
+		tOrientation,
 		tTileWidth,
 		tTileLength,
 		tImageLength,
@@ -696,12 +697,21 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 
 // Decode reads a TIFF image from r and returns it as an image.Image.
 // The type of Image returned depends on the contents of the TIFF.
-func Decode(r io.Reader) (img image.Image, err error) {
+//
+// Decode does not apply the TIFF Orientation tag: the returned image has
+// the dimensions and pixel layout stored in the file. Use
+// DecodeWithOrientation to additionally normalize the image orientation.
+func Decode(r io.Reader) (image.Image, error) {
 	d, err := newDecoder(r)
 	if err != nil {
-		return
+		return nil, err
 	}
+	return d.decodeImage()
+}
 
+// decodeImage decodes the pixel data of the image described by d.
+// It does not apply any orientation normalization.
+func (d *decoder) decodeImage() (img image.Image, err error) {
 	blockPadding := false
 	blockWidth := d.config.Width
 	blockHeight := d.config.Height

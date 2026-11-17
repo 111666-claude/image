@@ -63,6 +63,7 @@ const (
 
 	tPredictor    = 317
 	tColorMap     = 320
+	tOrientation  = 274
 	tExtraSamples = 338
 	tSampleFormat = 339
 )
