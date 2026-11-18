@@ -546,15 +546,11 @@ type byteOrder interface {
 
 // newTIFF returns the TIFF header.
 func newTIFF(enc byteOrder) []byte {
-	b := []byte{0, 0, 0, 42, 0, 0, 0, 0}
-	switch enc.Uint16([]byte{1, 0}) {
-	case 0x1:
-		b[0], b[1] = 'I', 'I'
-	case 0x100:
+	b := []byte{'I', 'I', 0, 0, 0, 0, 0, 0}
+	if enc.Uint16([]byte{0, 1}) == 0x1 {
 		b[0], b[1] = 'M', 'M'
-	default:
-		panic("odd byte order")
 	}
+	enc.PutUint16(b[2:4], 42)
 	return b
 }
 
@@ -585,16 +581,35 @@ func appendIFD(b []byte, enc byteOrder, entries map[uint16]interface{}) []byte {
 		case []uint16:
 			ifd = enc.AppendUint16(ifd, dtShort)
 			ifd = enc.AppendUint32(ifd, uint32(len(v)))
-			switch len(v) {
-			case 0:
+			switch {
+			case len(v) == 0:
 				ifd = enc.AppendUint32(ifd, 0)
-			case 1:
-				ifd = enc.AppendUint16(ifd, v[0])
-				ifd = enc.AppendUint16(ifd, 0)
+			case len(v)*2 <= 4:
+				// The values fit in the 4-byte value field.
+				for _, e := range v {
+					ifd = enc.AppendUint16(ifd, e)
+				}
+				for i := len(v); i < 2; i++ {
+					ifd = enc.AppendUint16(ifd, 0)
+				}
 			default:
 				ifd = enc.AppendUint32(ifd, uint32(len(b)))
 				for _, e := range v {
 					b = enc.AppendUint16(b, e)
+				}
+			}
+		case [][2]uint32:
+			// An array of rationals. Each pair is a numerator and a
+			// denominator, stored as two uint32s.
+			ifd = enc.AppendUint16(ifd, dtRational)
+			ifd = enc.AppendUint32(ifd, uint32(len(v)))
+			if len(v) == 0 {
+				ifd = enc.AppendUint32(ifd, 0)
+			} else {
+				ifd = enc.AppendUint32(ifd, uint32(len(b)))
+				for _, e := range v {
+					b = enc.AppendUint32(b, e[0])
+					b = enc.AppendUint32(b, e[1])
 				}
 			}
 		case []uint32:

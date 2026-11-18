@@ -65,6 +65,10 @@ const (
 	tColorMap     = 320
 	tExtraSamples = 338
 	tSampleFormat = 339
+
+	tYCbCrSubSampling    = 530
+	tYCbCrPositioning    = 531
+	tReferenceBlackWhite = 532
 )
 
 // Compression types (defined in various places in the spec and supplements).
@@ -118,6 +122,7 @@ const (
 	mRGBA
 	mNRGBA
 	mCMYK
+	mYCbCr
 )
 
 // CompressionType describes the type of compression used in Options.

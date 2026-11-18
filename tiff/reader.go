@@ -102,6 +102,12 @@ type decoder struct {
 	off   int    // Current offset in buf.
 	v     uint32 // Buffer value for reading with arbitrary bit depths.
 	nbits uint   // Remaining number of bits in v.
+
+	// YCbCr-specific state, set only when mode == mYCbCr.
+	subsampleRatio image.YCbCrSubsampleRatio
+	hsub, vsub     int           // Chroma subsampling factors.
+	refBlackWhite  []float64     // Raw ReferenceBlackWhite values, nil if absent.
+	ycbcrLUT       [3][256]uint8 // Y, Cb, Cr normalization tables from ReferenceBlackWhite.
 }
 
 // firstVal returns the first uint of the features entry with the given tag,
@@ -177,6 +183,43 @@ func (d *decoder) ifdUint(p []byte, maxCount int) (u []uint, err error) {
 	return u, nil
 }
 
+// ifdRational decodes the IFD entry in p, which must be of the Rational
+// type, and returns the decoded values as float64s.
+//
+// maxCount limits the number of values.
+// If the entry contains more than maxCount values, only the first maxCount are parsed.
+func (d *decoder) ifdRational(p []byte, maxCount int) (u []float64, err error) {
+	if len(p) < ifdLen {
+		return nil, FormatError("bad IFD entry")
+	}
+	if datatype := d.byteOrder.Uint16(p[2:4]); datatype != dtRational {
+		return nil, UnsupportedError("IFD entry datatype")
+	}
+
+	count := d.byteOrder.Uint32(p[4:8])
+	if count > math.MaxInt32/lengths[dtRational] {
+		return nil, FormatError("IFD data too large")
+	}
+	truncatedCount := min(int(count), maxCount)
+	// A rational is 8 bytes, so the IFD always contains a pointer to the
+	// real value.
+	raw, err := safeReadAt(d.r, uint64(lengths[dtRational])*uint64(truncatedCount), int64(d.byteOrder.Uint32(p[8:12])))
+	if err != nil {
+		return nil, err
+	}
+
+	u = make([]float64, truncatedCount)
+	for i := range u {
+		num := d.byteOrder.Uint32(raw[8*i : 8*i+4])
+		den := d.byteOrder.Uint32(raw[8*i+4 : 8*i+8])
+		if den == 0 {
+			return nil, FormatError("invalid ReferenceBlackWhite: zero denominator")
+		}
+		u[i] = float64(num) / float64(den)
+	}
+	return u, nil
+}
+
 // parseIFDOffsets parses an IFD entry stored in d.ifd using ifdUint.
 // For IFD entries which can be large, we delay reading and parsing the entry
 // until we know the image size, which lets us set reasonable bounds on the IFD entry.
@@ -215,12 +258,20 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tImageWidth,
 		tFillOrder,
 		tT4Options,
-		tT6Options:
+		tT6Options,
+		tYCbCrSubSampling,
+		tYCbCrPositioning:
 		val, err := d.ifdUint(p, smallEntryMaxCount)
 		if err != nil {
 			return 0, err
 		}
 		d.features[int(tag)] = val
+	case tReferenceBlackWhite:
+		val, err := d.ifdRational(p, 6)
+		if err != nil {
+			return 0, err
+		}
+		d.refBlackWhite = val
 	case tStripOffsets,
 		tStripByteCounts,
 		tTileOffsets,
@@ -507,6 +558,50 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				copy(img.Pix[min:max], d.buf[i0:i1])
 			}
 		}
+	case mYCbCr:
+		img := dst.(*image.YCbCr)
+		// The data is laid out as a sequence of subsampling blocks, each
+		// covering hsub*vsub pixels: first the hsub*vsub Y samples (row by
+		// row), then one Cb and one Cr sample. The region is padded with
+		// dummy samples up to a whole number of blocks.
+		w := xmax - xmin
+		h := ymax - ymin
+		nBlocksX := (w + d.hsub - 1) / d.hsub
+		nBlocksY := (h + d.vsub - 1) / d.vsub
+		off := 0
+		for by := 0; by < nBlocksY; by++ {
+			for bx := 0; bx < nBlocksX; bx++ {
+				for j := 0; j < d.vsub; j++ {
+					y := ymin + by*d.vsub + j
+					for i := 0; i < d.hsub; i++ {
+						if off >= len(d.buf) {
+							return errNoPixels
+						}
+						v := d.buf[off]
+						off++
+						x := xmin + bx*d.hsub + i
+						if x < rMaxX && y < rMaxY {
+							img.Y[img.YOffset(x, y)] = d.ycbcrLUT[0][v]
+						}
+					}
+				}
+				if off+2 > len(d.buf) {
+					return errNoPixels
+				}
+				cb, cr := d.buf[off], d.buf[off+1]
+				off += 2
+				// gx and gy are multiples of the subsampling factors (this
+				// is enforced for strips and tiles in Decode), so COffset
+				// lands exactly on this block's chroma sample.
+				gx := xmin + bx*d.hsub
+				gy := ymin + by*d.vsub
+				if gx < rMaxX && gy < rMaxY {
+					ci := img.COffset(gx, gy)
+					img.Cb[ci] = d.ycbcrLUT[1][cb]
+					img.Cr[ci] = d.ycbcrLUT[2][cr]
+				}
+			}
+		}
 	}
 
 	return nil
@@ -665,10 +760,86 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		} else {
 			d.config.ColorModel = color.GrayModel
 		}
+	case pYCbCr:
+		// Only 8-bit YCbCr with three samples per pixel is supported.
+		if d.bpp != 8 {
+			return nil, UnsupportedError(fmt.Sprintf("BitsPerSample of %v", d.bpp))
+		}
+		if len(d.features[tBitsPerSample]) != 3 {
+			return nil, FormatError("wrong number of samples for YCbCr")
+		}
+		for _, b := range d.features[tBitsPerSample] {
+			if b != 8 {
+				return nil, FormatError("wrong number of bits for YCbCr")
+			}
+		}
+		d.mode = mYCbCr
+		d.config.ColorModel = color.YCbCrModel
+
+		// The YCbCrSubSampling tag (p. 91-92 of the spec) defaults to
+		// 2,2, also known as 4:2:0.
+		hsub, vsub := uint(2), uint(2)
+		if f, ok := d.features[tYCbCrSubSampling]; ok {
+			if len(f) != 2 {
+				return nil, FormatError("invalid YCbCrSubSampling")
+			}
+			hsub, vsub = f[0], f[1]
+		}
+		switch {
+		case hsub == 1 && vsub == 1:
+			d.subsampleRatio = image.YCbCrSubsampleRatio444
+		case hsub == 1 && vsub == 2:
+			d.subsampleRatio = image.YCbCrSubsampleRatio440
+		case hsub == 2 && vsub == 1:
+			d.subsampleRatio = image.YCbCrSubsampleRatio422
+		case hsub == 2 && vsub == 2:
+			d.subsampleRatio = image.YCbCrSubsampleRatio420
+		case hsub == 4 && vsub == 1:
+			d.subsampleRatio = image.YCbCrSubsampleRatio411
+		case hsub == 4 && vsub == 4:
+			d.subsampleRatio = image.YCbCrSubsampleRatio410
+		default:
+			valid := func(v uint) bool { return v == 1 || v == 2 || v == 4 }
+			if valid(hsub) && valid(vsub) {
+				// Valid per the spec, but not representable by image.YCbCr.
+				return nil, UnsupportedError(fmt.Sprintf("YCbCr subsampling %d,%d", hsub, vsub))
+			}
+			return nil, FormatError(fmt.Sprintf("invalid YCbCr subsampling %d,%d", hsub, vsub))
+		}
+		d.hsub, d.vsub = int(hsub), int(vsub)
+
+		// ReferenceBlackWhite (p. 43 of the spec) maps the stored Y, Cb and
+		// Cr values onto the full 0-255 range expected by color.YCbCrModel.
+		// The default is the identity mapping.
+		rbw := d.refBlackWhite
+		if rbw == nil {
+			rbw = []float64{0, 255, 128, 255, 128, 255}
+		}
+		if len(rbw) != 6 {
+			return nil, FormatError("invalid ReferenceBlackWhite")
+		}
+		for i := 0; i < 3; i++ {
+			black, white := rbw[2*i], rbw[2*i+1]
+			if !(0 <= black && black < white && white <= 255) {
+				return nil, FormatError("invalid ReferenceBlackWhite")
+			}
+			// Luma is normalized to the full 0-255 range. Chroma is
+			// normalized to a signed deviation from 128 (the neutral
+			// point), so the default of (128, 255) is the identity.
+			// See the ReferenceBlackWhite description on p. 43 of the spec.
+			scale, offset := 255.0, 0.0
+			if i > 0 {
+				scale, offset = 127.0, 128.0
+			}
+			for j := 0; j < 256; j++ {
+				v := (float64(j)-black)*scale/(white-black) + offset
+				d.ycbcrLUT[i][j] = uint8(min(255, max(0, int(v+0.5))))
+			}
+		}
 	default:
 		return nil, UnsupportedError("color model")
 	}
-	if d.firstVal(tPhotometricInterpretation) != pRGB {
+	if photo := d.firstVal(tPhotometricInterpretation); photo != pRGB && photo != pYCbCr {
 		if len(d.features[tBitsPerSample]) != 1 {
 			return nil, UnsupportedError("extra samples")
 		}
@@ -799,6 +970,22 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		return nil, FormatError("inconsistent header")
 	}
 
+	if d.mode == mYCbCr {
+		// Chroma samples are shared between the pixels of a subsampling
+		// block, so block boundaries must line up with the subsampling
+		// grid. For tiles this means the tile dimensions must be multiples
+		// of the subsampling factors; for strips, each strip except the
+		// last must contain a whole number of chroma rows. Strip widths
+		// need no check: every strip starts at the left edge of the image.
+		if blockPadding {
+			if blockWidth%d.hsub != 0 || blockHeight%d.vsub != 0 {
+				return nil, FormatError("tile dimensions are not a multiple of the YCbCr subsampling factors")
+			}
+		} else if blocksDown > 1 && blockHeight%d.vsub != 0 {
+			return nil, FormatError("strip height is not a multiple of the vertical YCbCr subsampling factor")
+		}
+	}
+
 	imgRect := image.Rect(0, 0, d.config.Width, d.config.Height)
 	switch d.mode {
 	case mGray, mGrayInvert:
@@ -821,6 +1008,8 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		} else {
 			img = image.NewRGBA(imgRect)
 		}
+	case mYCbCr:
+		img = image.NewYCbCr(imgRect, d.subsampleRatio)
 	}
 
 	if blocksAcross == 0 || blocksDown == 0 {
