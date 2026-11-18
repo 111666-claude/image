@@ -8,6 +8,7 @@
 package bmp // import "golang.org/x/image/bmp"
 
 import (
+	"bytes"
 	"errors"
 	"image"
 	"image/color"
@@ -20,7 +21,16 @@ import (
 // feature.
 var ErrUnsupported = errors.New("bmp: unsupported BMP image")
 
-var errInvalidPaletteIndex = errors.New("bmp: invalid palette index")
+var (
+	errInvalidPaletteIndex = errors.New("bmp: invalid palette index")
+	errInvalidProfile      = errors.New("bmp: invalid color profile")
+)
+
+// Color profile values for the bV5CSType field of a BITMAPV5HEADER.
+const (
+	lcsProfileEmbedded = 0x4d424544 // 'MBED'
+	lcsProfileLinked   = 0x4c494e4b // 'LINK'
+)
 
 func readUint16(b []byte) uint16 {
 	return uint16(b[0]) | uint16(b[1])<<8
@@ -126,13 +136,9 @@ func decodeNRGBA(r io.Reader, c image.Config, topDown, allowAlpha bool) (image.I
 	return rgba, nil
 }
 
-// Decode reads a BMP image from r and returns it as an image.Image.
-// Limitation: The file must be 8, 24 or 32 bits per pixel.
-func Decode(r io.Reader) (image.Image, error) {
-	c, bpp, topDown, allowAlpha, err := decodeConfig(r)
-	if err != nil {
-		return nil, err
-	}
+// decodePixels reads the pixel data of a BMP image from r, which must be
+// positioned at the start of the pixel array.
+func decodePixels(r io.Reader, c image.Config, bpp int, topDown, allowAlpha bool) (image.Image, error) {
 	switch bpp {
 	case 1, 2, 4, 8:
 		return decodePaletted(r, c, topDown, bpp)
@@ -144,45 +150,164 @@ func Decode(r io.Reader) (image.Image, error) {
 	panic("unreachable")
 }
 
+// pixelDataLen returns the length in bytes of the BMP pixel array,
+// including per-row padding to a 4-byte boundary.
+func pixelDataLen(c image.Config, bpp int) int {
+	var bytesPerRow int
+	switch bpp {
+	case 1, 2, 4, 8:
+		pixelsPerByte := 8 / bpp
+		bytesPerRow = ((c.Width+pixelsPerByte-1)/pixelsPerByte + 3) &^ 3
+	case 24:
+		bytesPerRow = (3*c.Width + 3) &^ 3
+	case 32:
+		bytesPerRow = 4 * c.Width
+	}
+	// decodeConfig already checked that 4*width*height fits in an int, and
+	// bytesPerRow <= 4*width, so this cannot overflow.
+	return bytesPerRow * c.Height
+}
+
+// Decode reads a BMP image from r and returns it as an image.Image.
+// Limitation: The file must be 8, 24 or 32 bits per pixel.
+func Decode(r io.Reader) (image.Image, error) {
+	c, bpp, topDown, allowAlpha, _, _, err := decodeConfig(r)
+	if err != nil {
+		return nil, err
+	}
+	return decodePixels(r, c, bpp, topDown, allowAlpha)
+}
+
+// ColorProfile describes the color profile information stored in the
+// BITMAPV5HEADER of a BMP image.
+type ColorProfile struct {
+	// Embedded holds the raw bytes of the ICC profile embedded in the BMP
+	// file (bV5CSType == PROFILE_EMBEDDED). It is nil if the profile is not
+	// embedded.
+	Embedded []byte
+	// Linked holds the name of the file containing the color profile when
+	// the profile is linked rather than embedded
+	// (bV5CSType == PROFILE_LINKED). It is empty otherwise. The linked file
+	// is external to the BMP image and is never read by this package.
+	Linked string
+}
+
+// DecodeWithProfile reads a BMP image from r and returns it as an
+// image.Image, along with the color profile information stored in its
+// BITMAPV5HEADER. The returned image and its pixel data are identical to
+// what Decode returns.
+//
+// The returned *ColorProfile is nil unless the BMP uses a BITMAPV5HEADER
+// whose bV5CSType is PROFILE_EMBEDDED or PROFILE_LINKED with a non-zero
+// profile size. BMP images with any other color space type (such as
+// LCS_sRGB) carry no profile data and yield a nil *ColorProfile, as do
+// images with older (pre-V5) headers.
+func DecodeWithProfile(r io.Reader) (image.Image, *ColorProfile, error) {
+	c, bpp, topDown, allowAlpha, dataOffset, prof, err := decodeConfig(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	if prof.size == 0 || (prof.csType != lcsProfileEmbedded && prof.csType != lcsProfileLinked) {
+		img, err := decodePixels(r, c, bpp, topDown, allowAlpha)
+		if err != nil {
+			return nil, nil, err
+		}
+		return img, nil, nil
+	}
+	// The profile data is located prof.offset bytes after the start of the
+	// BITMAPV5HEADER (which itself starts at file offset fileHeaderLen) and
+	// is prof.size bytes long. It must not overlap the headers or the pixel
+	// array, and it must lie entirely within the file.
+	pixelLen := pixelDataLen(c, bpp)
+	profStart := uint64(fileHeaderLen) + uint64(prof.offset)
+	profEnd := profStart + uint64(prof.size)
+	pixelEnd := uint64(dataOffset) + uint64(pixelLen)
+	if profStart < pixelEnd {
+		return nil, nil, errInvalidProfile
+	}
+	img, err := decodePixels(r, c, bpp, topDown, allowAlpha)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Skip any gap between the end of the pixel array and the profile data.
+	if _, err := io.CopyN(io.Discard, r, int64(profStart-pixelEnd)); err != nil {
+		return nil, nil, errInvalidProfile
+	}
+	// Read the profile data. CopyN allocates only as the data actually
+	// arrives, so a truncated file with a huge declared profile size does
+	// not cause a huge allocation.
+	var buf bytes.Buffer
+	if _, err := io.CopyN(&buf, r, int64(profEnd-profStart)); err != nil {
+		return nil, nil, errInvalidProfile
+	}
+	p := &ColorProfile{}
+	if prof.csType == lcsProfileEmbedded {
+		p.Embedded = buf.Bytes()
+	} else {
+		// A linked profile is stored as a NUL-terminated file name.
+		name := buf.Bytes()
+		if i := bytes.IndexByte(name, 0); i >= 0 {
+			name = name[:i]
+		}
+		p.Linked = string(name)
+	}
+	return img, p, nil
+}
+
 // DecodeConfig returns the color model and dimensions of a BMP image without
 // decoding the entire image.
 // Limitation: The file must be 8, 24 or 32 bits per pixel.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	config, _, _, _, err := decodeConfig(r)
+	config, _, _, _, _, _, err := decodeConfig(r)
 	return config, err
 }
 
-func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown bool, allowAlpha bool, err error) {
+// v5Profile holds the color profile fields of a BITMAPV5HEADER.
+type v5Profile struct {
+	csType uint32 // bV5CSType
+	offset uint32 // bV5ProfileData, relative to the start of the header
+	size   uint32 // bV5ProfileSize
+}
+
+const (
+	fileHeaderLen   = 14
+	infoHeaderLen   = 40
+	v4InfoHeaderLen = 108
+	v5InfoHeaderLen = 124
+)
+
+func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown bool, allowAlpha bool, dataOffset uint32, prof v5Profile, err error) {
 	// We only support those BMP images with one of the following DIB headers:
 	// - BITMAPINFOHEADER (40 bytes)
 	// - BITMAPV4HEADER (108 bytes)
 	// - BITMAPV5HEADER (124 bytes)
-	const (
-		fileHeaderLen   = 14
-		infoHeaderLen   = 40
-		v4InfoHeaderLen = 108
-		v5InfoHeaderLen = 124
-	)
 	var b [1024]byte
 	if _, err := io.ReadFull(r, b[:fileHeaderLen+4]); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return image.Config{}, 0, false, false, err
+		return image.Config{}, 0, false, false, 0, v5Profile{}, err
 	}
 	if string(b[:2]) != "BM" {
-		return image.Config{}, 0, false, false, errors.New("bmp: invalid format")
+		return image.Config{}, 0, false, false, 0, v5Profile{}, errors.New("bmp: invalid format")
 	}
 	offset := readUint32(b[10:14])
 	infoLen := readUint32(b[14:18])
 	if infoLen != infoHeaderLen && infoLen != v4InfoHeaderLen && infoLen != v5InfoHeaderLen {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 	}
 	if _, err := io.ReadFull(r, b[fileHeaderLen+4:fileHeaderLen+infoLen]); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return image.Config{}, 0, false, false, err
+		return image.Config{}, 0, false, false, 0, v5Profile{}, err
+	}
+	if infoLen == v5InfoHeaderLen {
+		prof = v5Profile{
+			csType: readUint32(b[70:74]),
+			offset: readUint32(b[126:130]),
+			size:   readUint32(b[130:134]),
+		}
 	}
 	width := int(int32(readUint32(b[18:22])))
 	height := int(int32(readUint32(b[22:26])))
@@ -190,17 +315,17 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		height, topDown = -height, true
 	}
 	if width < 0 || height < 0 {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 	}
 	if (width == 0) != (height == 0) {
 		// We'll take 0x0, but Nx0 or 0xN is suspicious.
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 	}
 	// Check that the image fits in memory.
 	// This conservatively assumes 4 bytes per pixel,
 	// rather than using the actual pixel size.
 	if _, ok := safemath.Mul3(width, height, 4); !ok {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 	}
 	// We only support 1 plane and 8, 24 or 32 bits per pixel and no
 	// compression.
@@ -213,7 +338,7 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		compression = 0
 	}
 	if planes != 1 || compression != 0 {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 	}
 	switch bpp {
 	case 1, 2, 4, 8:
@@ -222,15 +347,15 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		if colorUsed == 0 {
 			colorUsed = 1 << bpp
 		} else if colorUsed > (1 << bpp) {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 		}
 
 		if offset != fileHeaderLen+infoLen+colorUsed*4 {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 		}
 		_, err = io.ReadFull(r, b[:colorUsed*4])
 		if err != nil {
-			return image.Config{}, 0, false, false, err
+			return image.Config{}, 0, false, false, 0, v5Profile{}, err
 		}
 		pcm := make(color.Palette, colorUsed)
 		for i := range pcm {
@@ -238,15 +363,15 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 			// Every 4th byte is padding.
 			pcm[i] = color.RGBA{b[4*i+2], b[4*i+1], b[4*i+0], 0xFF}
 		}
-		return image.Config{ColorModel: pcm, Width: width, Height: height}, int(bpp), topDown, false, nil
+		return image.Config{ColorModel: pcm, Width: width, Height: height}, int(bpp), topDown, false, offset, prof, nil
 	case 24:
 		if offset != fileHeaderLen+infoLen {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 		}
-		return image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}, 24, topDown, false, nil
+		return image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}, 24, topDown, false, offset, prof, nil
 	case 32:
 		if offset != fileHeaderLen+infoLen {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 		}
 		// 32 bits per pixel is possibly RGBX (X is padding) or RGBA (A is
 		// alpha transparency). However, for BMP images, "Alpha is a
@@ -269,9 +394,9 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		// infoHeaderLen) condition distinguishes BITMAPINFOHEADER (40 bytes)
 		// vs later (larger) headers.
 		allowAlpha = infoLen > infoHeaderLen
-		return image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}, 32, topDown, allowAlpha, nil
+		return image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}, 32, topDown, allowAlpha, offset, prof, nil
 	}
-	return image.Config{}, 0, false, false, ErrUnsupported
+	return image.Config{}, 0, false, false, 0, v5Profile{}, ErrUnsupported
 }
 
 func init() {
