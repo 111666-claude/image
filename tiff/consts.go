@@ -44,10 +44,11 @@ const (
 
 	tFillOrder = 266
 
-	tStripOffsets    = 273
-	tSamplesPerPixel = 277
-	tRowsPerStrip    = 278
-	tStripByteCounts = 279
+	tStripOffsets        = 273
+	tSamplesPerPixel     = 277
+	tRowsPerStrip        = 278
+	tStripByteCounts     = 279
+	tPlanarConfiguration = 284
 
 	tT4Options = 292 // CCITT Group 3 options, a set of 32 flag bits.
 	tT6Options = 293 // CCITT Group 4 options, a set of 32 flag bits.
@@ -104,6 +105,12 @@ const (
 	resNone    = 1
 	resPerInch = 2 // Dots per inch.
 	resPerCM   = 3 // Dots per centimeter.
+)
+
+// Values for the tPlanarConfiguration tag (page 38-39 of the spec).
+const (
+	pcChunky = 1
+	pcPlanar = 2
 )
 
 // imageMode represents the mode of the image.

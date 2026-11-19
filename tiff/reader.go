@@ -206,6 +206,7 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 	case tBitsPerSample,
 		tExtraSamples,
 		tPhotometricInterpretation,
+		tPlanarConfiguration,
 		tCompression,
 		tPredictor,
 		tRowsPerStrip,
@@ -477,6 +478,19 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				copy(img.Pix[min:max], d.buf[i0:i1])
 			}
 		}
+	case mCMYK:
+		// Only 8-bit chunky CMYK images are supported, so each pixel is
+		// exactly four bytes. The layout matches image.CMYK's Pix layout.
+		img := dst.(*image.CMYK)
+		for y := ymin; y < rMaxY; y++ {
+			min := img.PixOffset(xmin, y)
+			max := img.PixOffset(rMaxX, y)
+			i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
+			if i1 > len(d.buf) {
+				return errNoPixels
+			}
+			copy(img.Pix[min:max], d.buf[i0:i1])
+		}
 	case mRGBA:
 		rowBytes := calcRowBytes(xmin, xmax, 4, d.bpp)
 		if d.bpp == 16 {
@@ -665,10 +679,32 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		} else {
 			d.config.ColorModel = color.GrayModel
 		}
+	case pCMYK:
+		// Only chunky (PlanarConfiguration = 1), 8-bit, four-sample
+		// CMYK images are supported.
+		if pc := d.firstVal(tPlanarConfiguration); pc != 0 && pc != pcChunky {
+			return nil, UnsupportedError("planar configuration")
+		}
+		if d.bpp != 8 {
+			return nil, UnsupportedError(fmt.Sprintf("BitsPerSample of %v for CMYK", d.bpp))
+		}
+		if len(d.features[tBitsPerSample]) != 4 {
+			return nil, FormatError("wrong number of samples for CMYK")
+		}
+		for _, b := range d.features[tBitsPerSample] {
+			if b != 8 {
+				return nil, FormatError("wrong number of samples for 8bit CMYK")
+			}
+		}
+		d.mode = mCMYK
+		d.config.ColorModel = color.CMYKModel
 	default:
 		return nil, UnsupportedError("color model")
 	}
-	if d.firstVal(tPhotometricInterpretation) != pRGB {
+	switch d.firstVal(tPhotometricInterpretation) {
+	case pRGB, pCMYK:
+		// These modes allow more than one sample per pixel.
+	default:
 		if len(d.features[tBitsPerSample]) != 1 {
 			return nil, UnsupportedError("extra samples")
 		}
@@ -815,6 +851,8 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		} else {
 			img = image.NewNRGBA(imgRect)
 		}
+	case mCMYK:
+		img = image.NewCMYK(imgRect)
 	case mRGB, mRGBA:
 		if d.bpp == 16 {
 			img = image.NewRGBA64(imgRect)
