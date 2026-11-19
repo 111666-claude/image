@@ -208,6 +208,7 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tPhotometricInterpretation,
 		tCompression,
 		tPredictor,
+		tPlanarConfiguration,
 		tRowsPerStrip,
 		tTileWidth,
 		tTileLength,
@@ -566,6 +567,14 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		prevTag = tag
 	}
 
+	// The old-style (Tech note 2) JPEG compression is a distinct, deprecated
+	// scheme that relies on separate JPEG tables and per-component strips;
+	// it is not interchangeable with the new-style (compression 7) full-frame
+	// JPEG streams and is not supported.
+	if d.firstVal(tCompression) == cJPEGOld {
+		return nil, UnsupportedError("old-style JPEG compression (compression 6)")
+	}
+
 	if d.config.Width, err = d.firstIntVal(tImageWidth); err != nil {
 		return nil, err
 	}
@@ -598,7 +607,7 @@ func newDecoder(r io.Reader) (*decoder, error) {
 
 	// Determine the image mode.
 	switch d.firstVal(tPhotometricInterpretation) {
-	case pRGB:
+	case pRGB, pYCbCr:
 		if d.bpp == 16 {
 			for _, b := range d.features[tBitsPerSample] {
 				if b != 16 {
@@ -668,13 +677,51 @@ func newDecoder(r io.Reader) (*decoder, error) {
 	default:
 		return nil, UnsupportedError("color model")
 	}
-	if d.firstVal(tPhotometricInterpretation) != pRGB {
+	switch d.firstVal(tPhotometricInterpretation) {
+	case pRGB, pYCbCr:
+		// Multi-component images carry all components of one pixel
+		// contiguously; JPEG-in-TIFF only defines the chunky layout.
+	default:
 		if len(d.features[tBitsPerSample]) != 1 {
 			return nil, UnsupportedError("extra samples")
 		}
 	}
 
+	if d.firstVal(tCompression) == cJPEG {
+		if err := d.checkJPEGMode(); err != nil {
+			return nil, err
+		}
+	}
+
 	return d, nil
+}
+
+// checkJPEGMode validates the IFD constraints of the new-style JPEG
+// compression (TIFF Tech note 2, compression value 7), where each strip holds
+// a complete, self-contained baseline JPEG stream.
+func (d *decoder) checkJPEGMode() error {
+	// Each JPEG strip carries 8-bit samples.
+	if d.bpp != 8 {
+		return UnsupportedError(fmt.Sprintf("JPEG compression with %v BitsPerSample", d.bpp))
+	}
+	if len(d.features[tBitsPerSample]) != 3 {
+		return UnsupportedError("JPEG compression requires 3 samples per pixel")
+	}
+	switch d.firstVal(tPhotometricInterpretation) {
+	case pRGB, pYCbCr:
+	default:
+		return UnsupportedError("JPEG compression with unsupported photometric interpretation")
+	}
+	// The PlanarConfiguration tag defaults to chunky (1) when absent.
+	if pc := d.firstVal(tPlanarConfiguration); pc != 0 && pc != pcChunky {
+		return UnsupportedError("JPEG compression with planar (non-chunky) PlanarConfiguration")
+	}
+	// The TIFF horizontal predictor is defined for uncompressed and LZW/
+	// Deflate data; a JPEG strip already contains its own encoded data.
+	if p := d.firstVal(tPredictor); p != 0 && p != prNone {
+		return UnsupportedError(fmt.Sprintf("JPEG compression with predictor %v", p))
+	}
+	return nil
 }
 
 // DecodeConfig returns the color model and dimensions of a TIFF image without
@@ -828,6 +875,9 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	}
 	// Maximum data per pixel is 8 bytes (RGBA64).
 	blockMaxDataSize := int64(blockWidth) * int64(blockHeight) * 8
+	// A JPEG strip holds compressed (encoded) data, so its size is bounded
+	// independently of the uncompressed-pixel limit above.
+	const jpegBlockMaxDataSize = 64 << 20 // 64 MiB
 	for i := 0; i < blocksAcross; i++ {
 		blkW := blockWidth
 		if !blockPadding && i == blocksAcross-1 && d.config.Width%blockWidth != 0 {
@@ -840,6 +890,8 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			}
 			offset := int64(blockOffsets[j*blocksAcross+i])
 			n := int64(blockCounts[j*blocksAcross+i])
+			blockIndex := j*blocksAcross + i
+			isJPEG := false
 			switch d.firstVal(tCompression) {
 
 			// According to the spec, Compression does not have a default value,
@@ -878,6 +930,12 @@ func Decode(r io.Reader) (img image.Image, err error) {
 				r.Close()
 			case cPackBits:
 				d.buf, err = unpackBits(io.NewSectionReader(d.r, offset, n), blockMaxDataSize)
+			case cJPEG:
+				// Each strip is one complete baseline JPEG stream.
+				if n > jpegBlockMaxDataSize {
+					return nil, FormatError("block data size too large")
+				}
+				isJPEG = true
 			default:
 				err = UnsupportedError(fmt.Sprintf("compression value %d", d.firstVal(tCompression)))
 			}
@@ -889,6 +947,14 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			ymin := j * blockHeight
 			xmax := xmin + blkW
 			ymax := ymin + blkH
+			if isJPEG {
+				// JPEG strips decode directly into the destination image,
+				// placed at the strip's row range.
+				if err = d.decodeJPEG(img, blockIndex, xmin, ymin, offset, n, blkW, blkH); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			err = d.decode(img, xmin, ymin, xmax, ymax)
 			if err != nil {
 				return nil, err

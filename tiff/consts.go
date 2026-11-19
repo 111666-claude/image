@@ -44,10 +44,11 @@ const (
 
 	tFillOrder = 266
 
-	tStripOffsets    = 273
-	tSamplesPerPixel = 277
-	tRowsPerStrip    = 278
-	tStripByteCounts = 279
+	tStripOffsets        = 273
+	tSamplesPerPixel     = 277
+	tRowsPerStrip        = 278
+	tStripByteCounts     = 279
+	tPlanarConfiguration = 284
 
 	tT4Options = 292 // CCITT Group 3 options, a set of 32 flag bits.
 	tT6Options = 293 // CCITT Group 4 options, a set of 32 flag bits.
@@ -97,6 +98,12 @@ const (
 const (
 	prNone       = 1
 	prHorizontal = 2
+)
+
+// Values for the tPlanarConfiguration tag (page 39 of the spec).
+const (
+	pcChunky = 1 // Chunky format.
+	pcPlanar = 2 // Planar format.
 )
 
 // Values for the tResolutionUnit tag (page 18).
