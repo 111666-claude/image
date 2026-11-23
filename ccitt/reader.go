@@ -4,7 +4,7 @@
 
 //go:generate go run gen.go
 
-// Package ccitt implements a CCITT (fax) image decoder.
+// Package ccitt implements a CCITT (fax) image decoder and encoder.
 package ccitt
 
 import (
@@ -616,44 +616,58 @@ const (
 
 // findB finds either the b1 or b2 value.
 func (z *reader) findB(whichB bool) int {
+	return findB(z.prev, len(z.curr), z.wi, z.atStartOfRow, z.penColorIsWhite, whichB)
+}
+
+// findB finds either the b1 or b2 value, scanning prev (1 byte per pixel,
+// either 0x00 black or 0xFF white), a row of the given width. The wi,
+// atStartOfRow and penColorIsWhite arguments describe the a0 reference
+// element. A prev whose length differs from width (including a nil prev) is
+// implicitly all white.
+func findB(prev []byte, width int, wi int, atStartOfRow bool, penColorIsWhite bool, whichB bool) int {
 	// The initial row is a special case. The previous row is implicitly all
 	// white, so that there are no changing pixel elements. We return b1 or b2
 	// to be at the end of the row.
-	if len(z.prev) != len(z.curr) {
-		return len(z.curr)
+	if len(prev) != width {
+		return width
 	}
 
-	i := z.wi
+	i := wi
 
-	if z.atStartOfRow {
+	if atStartOfRow {
 		// a0 is implicitly at -1, on a white pixel. b1 is the first black
 		// pixel in the previous row. b2 is the first white pixel after that.
-		for ; (i < len(z.prev)) && (z.prev[i] == 0xFF); i++ {
+		for ; (i < len(prev)) && (prev[i] == 0xFF); i++ {
 		}
 		if whichB == findB2 {
-			for ; (i < len(z.prev)) && (z.prev[i] == 0x00); i++ {
+			for ; (i < len(prev)) && (prev[i] == 0x00); i++ {
 			}
 		}
 		return i
 	}
 
 	// As per figure 1 above, assume that the current pen color is white.
-	// First, walk past every contiguous black pixel in prev, starting at a0.
-	oppositeColor := ^z.penColor()
-	for ; (i < len(z.prev)) && (z.prev[i] == oppositeColor); i++ {
+	penColor := byte(0x00)
+	if penColorIsWhite {
+		penColor = 0xFF
 	}
 
-	// Then walk past every contiguous white pixel.
-	penColor := ^oppositeColor
-	for ; (i < len(z.prev)) && (z.prev[i] == penColor); i++ {
+	// First, walk past every contiguous pixel in prev, starting at a0, of
+	// the color opposite to the pen color.
+	oppositeColor := ^penColor
+	for ; (i < len(prev)) && (prev[i] == oppositeColor); i++ {
 	}
 
-	// We're now at a black pixel (or at the end of the row). That's b1.
+	// Then walk past every contiguous pixel of the pen color.
+	for ; (i < len(prev)) && (prev[i] == penColor); i++ {
+	}
+
+	// We're now at a pixel of the opposite color (or at the end of the row).
+	// That's b1.
 	if whichB == findB2 {
-		// If we're looking for b2, walk past every contiguous black pixel
-		// again.
-		oppositeColor := ^penColor
-		for ; (i < len(z.prev)) && (z.prev[i] == oppositeColor); i++ {
+		// If we're looking for b2, walk past every contiguous pixel of the
+		// opposite color again.
+		for ; (i < len(prev)) && (prev[i] == oppositeColor); i++ {
 		}
 	}
 

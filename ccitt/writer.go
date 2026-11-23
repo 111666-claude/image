@@ -39,7 +39,10 @@ func (b *bitWriter) flushBits() error {
 	if b.order != MSB {
 		reverseBitsWithinBytes(b.bytes[:])
 	}
-	_, err := b.w.Write(b.bytes[:])
+	n, err := b.w.Write(b.bytes[:])
+	if (err == nil) && (n < len(b.bytes)) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
@@ -57,7 +60,10 @@ func (b *bitWriter) close() error {
 	}
 
 	// Write b.bw bytes to b.w.
-	_, err := b.w.Write(b.bytes[:b.bw])
+	n, err := b.w.Write(b.bytes[:b.bw])
+	if (err == nil) && (n < int(b.bw)) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
