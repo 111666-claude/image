@@ -9,9 +9,12 @@ import (
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"sort"
+
+	"golang.org/x/image/tiff/lzw"
 )
 
 // The TIFF format allows to choose the order of the different elements freely.
@@ -274,6 +277,17 @@ func writeIFD(w io.Writer, ifdOffset int, d []ifdEntry) error {
 	return err
 }
 
+// stripError adds strip context to an error encountered while compressing
+// pixel data. The encoder writes the whole image as a single strip, so the
+// strip is always strip 0 covering all rows. Errors from the uncompressed
+// and Deflate paths are returned unchanged.
+func stripError(compression uint32, d image.Point, err error) error {
+	if err == nil || compression != cLZW {
+		return err
+	}
+	return fmt.Errorf("tiff: error encoding LZW strip 0 (rows 0 to %d): %w", d.Y, err)
+}
+
 // Options are the encoding parameters.
 type Options struct {
 	// Compression is the type of compression used.
@@ -343,6 +357,10 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 		}
 	case cDeflate:
 		dst = zlib.NewWriter(&buf)
+	case cLZW:
+		// TIFF's LZW always uses MSB-first codes and a literal width
+		// of 8 bits, regardless of the image's bit depth.
+		dst = lzw.NewWriter(&buf, lzw.MSB, 8)
 	default:
 		return errors.New("tiff: unsupported compression")
 	}
@@ -399,12 +417,12 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 		err = encode(dst, m, predictor)
 	}
 	if err != nil {
-		return err
+		return stripError(compression, d, err)
 	}
 
 	if compression != cNone {
 		if err = dst.(io.Closer).Close(); err != nil {
-			return err
+			return stripError(compression, d, err)
 		}
 		imageLen = buf.Len()
 		if err = binary.Write(w, enc, uint32(imageLen+8)); err != nil {
