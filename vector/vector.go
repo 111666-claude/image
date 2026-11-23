@@ -48,6 +48,47 @@ import (
 // would still produce acceptable quality, but 512 seems to work.
 const floatingPointMathThreshold = 512
 
+const (
+	// maxAbsCoord is the largest absolute value accepted for a path
+	// coordinate (see Rasterizer.MoveTo). The fixed point math
+	// implementation uses 22.9 fixed point numbers, whose int32 storage
+	// overflows for coordinates with magnitude at or above 1<<22. Both the
+	// fixed and floating point implementations reject such coordinates with
+	// a panic, so that callers get a stable error instead of silently
+	// corrupted coverage.
+	maxAbsCoord = 1 << 22
+
+	// maxWidthOrHeight bounds the width and height passed to Reset.
+	maxWidthOrHeight = 1 << 22
+
+	// maxPixels bounds the width*height number of mask samples (and hence
+	// the size of the buffers) allocated by Reset. It is a resource limit
+	// that keeps rasterization memory consumption bounded even when the
+	// per-dimension limit alone would allow it.
+	maxPixels = 1 << 28
+)
+
+// FillRule determines which samples are inside a path when its contours
+// self-intersect or overlap. It corresponds to the "fill-rule" property in
+// SVG.
+type FillRule uint8
+
+const (
+	// NonZero is the non-zero winding rule: a sample is inside the path if
+	// the signed winding number of a ray cast from that sample is non-zero.
+	//
+	// This is the zero value of FillRule and matches the historical
+	// behavior of the Rasterizer.
+	NonZero FillRule = 0
+
+	// EvenOdd is the even-odd (alternating) winding rule: a sample is
+	// inside the path if a ray cast from that sample crosses an odd number
+	// of contour edges, regardless of the edges' direction. Nested or
+	// self-intersecting contours therefore alternate between inside and
+	// outside.
+	EvenOdd FillRule = 1
+)
+
 func lerp(t, px, py, qx, qy float32) (x, y float32) {
 	return px + t*(qx-px), py + t*(qy-py)
 }
@@ -60,6 +101,18 @@ func clamp(i, width int32) uint {
 		return uint(i)
 	}
 	return uint(width)
+}
+
+// checkCoord panics if x or y is NaN, infinite, or has magnitude at least
+// maxAbsCoord. The path geometry itself is otherwise allowed to extend
+// arbitrarily far outside the Rasterizer's bounds; this only rejects values
+// that the fixed point math cannot represent without overflow.
+func checkCoord(x, y float32) {
+	if !(math.Abs(float64(x)) < maxAbsCoord) || !(math.Abs(float64(y)) < maxAbsCoord) {
+		// The "!" comparisons also catch NaN, since every comparison with
+		// NaN is false.
+		panic("vector: path coordinate is NaN, infinite, or out of range")
+	}
 }
 
 // NewRasterizer returns a new Rasterizer whose rendered mask image is bounded
@@ -105,20 +158,43 @@ type Rasterizer struct {
 	// The zero value is draw.Over.
 	DrawOp draw.Op
 
+	// FillRule selects the winding rule used by the Draw method: NonZero or
+	// EvenOdd. It does not affect the path geometry recorded by the XxxTo
+	// calls, only how that path is filled, so switching it never modifies
+	// the source path.
+	//
+	// The zero value is NonZero.
+	FillRule FillRule
+
 	// TODO: an exported field equivalent to the mask point in the
 	// draw.DrawMask function in the stdlib image/draw package?
 }
 
 // Reset resets a Rasterizer as if it was just returned by NewRasterizer.
 //
-// This includes setting z.DrawOp to draw.Over.
+// This includes setting z.DrawOp to draw.Over and z.FillRule to NonZero.
+//
+// It panics if w or h are negative, if either is greater than
+// maxWidthOrHeight, or if their product is greater than maxPixels, so that
+// pathological dimensions fail with a stable error instead of causing
+// integer overflow or unbounded memory allocation.
 func (z *Rasterizer) Reset(w, h int) {
+	if w < 0 || h < 0 {
+		panic("vector: negative width or height in Rasterizer.Reset")
+	}
+	if w > maxWidthOrHeight || h > maxWidthOrHeight {
+		panic("vector: width or height exceeds maxWidthOrHeight in Rasterizer.Reset")
+	}
+	if int64(w)*int64(h) > maxPixels {
+		panic("vector: width*height exceeds maxPixels in Rasterizer.Reset")
+	}
 	z.size = image.Point{w, h}
 	z.firstX = 0
 	z.firstY = 0
 	z.penX = 0
 	z.penY = 0
 	z.DrawOp = draw.Over
+	z.FillRule = NonZero
 
 	z.setUseFloatingPointMath(w > floatingPointMathThreshold || h > floatingPointMathThreshold)
 }
@@ -172,8 +248,10 @@ func (z *Rasterizer) ClosePath() {
 
 // MoveTo starts a new path and moves the pen to (ax, ay).
 //
-// The coordinates are allowed to be out of the Rasterizer's bounds.
+// The coordinates are allowed to be out of the Rasterizer's bounds, subject
+// to the global maxAbsCoord limit.
 func (z *Rasterizer) MoveTo(ax, ay float32) {
+	checkCoord(ax, ay)
 	z.firstX = ax
 	z.firstY = ay
 	z.penX = ax
@@ -183,8 +261,10 @@ func (z *Rasterizer) MoveTo(ax, ay float32) {
 // LineTo adds a line segment, from the pen to (bx, by), and moves the pen to
 // (bx, by).
 //
-// The coordinates are allowed to be out of the Rasterizer's bounds.
+// The coordinates are allowed to be out of the Rasterizer's bounds, subject
+// to the global maxAbsCoord limit.
 func (z *Rasterizer) LineTo(bx, by float32) {
+	checkCoord(bx, by)
 	if z.useFloatingPointMath {
 		z.floatingLineTo(bx, by)
 	} else {
@@ -195,8 +275,11 @@ func (z *Rasterizer) LineTo(bx, by float32) {
 // QuadTo adds a quadratic Bézier segment, from the pen via (bx, by) to (cx,
 // cy), and moves the pen to (cx, cy).
 //
-// The coordinates are allowed to be out of the Rasterizer's bounds.
+// The coordinates are allowed to be out of the Rasterizer's bounds, subject
+// to the global maxAbsCoord limit.
 func (z *Rasterizer) QuadTo(bx, by, cx, cy float32) {
+	checkCoord(bx, by)
+	checkCoord(cx, cy)
 	ax, ay := z.penX, z.penY
 	devsq := devSquared(ax, ay, bx, by, cx, cy)
 	if devsq >= 0.333 {
@@ -216,8 +299,12 @@ func (z *Rasterizer) QuadTo(bx, by, cx, cy float32) {
 // CubeTo adds a cubic Bézier segment, from the pen via (bx, by) and (cx, cy)
 // to (dx, dy), and moves the pen to (dx, dy).
 //
-// The coordinates are allowed to be out of the Rasterizer's bounds.
+// The coordinates are allowed to be out of the Rasterizer's bounds, subject
+// to the global maxAbsCoord limit.
 func (z *Rasterizer) CubeTo(bx, by, cx, cy, dx, dy float32) {
+	checkCoord(bx, by)
+	checkCoord(cx, cy)
+	checkCoord(dx, dy)
 	ax, ay := z.penX, z.penY
 	devsq := devSquared(ax, ay, bx, by, dx, dy)
 	if devsqAlt := devSquared(ax, ay, cx, cy, dx, dy); devsq < devsqAlt {
@@ -269,6 +356,12 @@ func (z *Rasterizer) Draw(dst draw.Image, r image.Rectangle, src image.Image, sp
 	// TODO: adjust r and sp (and mp?) if src.Bounds() doesn't contain
 	// r.Add(sp.Sub(r.Min)).
 
+	switch z.FillRule {
+	case NonZero, EvenOdd:
+	default:
+		panic("vector: invalid Rasterizer.FillRule")
+	}
+
 	if src, ok := src.(*image.Uniform); ok {
 		srcR, srcG, srcB, srcA := src.RGBA()
 		switch dst := dst.(type) {
@@ -300,6 +393,21 @@ func (z *Rasterizer) Draw(dst draw.Image, r image.Rectangle, src image.Image, sp
 }
 
 func (z *Rasterizer) accumulateMask() {
+	if z.FillRule == EvenOdd {
+		width := int32(z.size.X)
+		if z.useFloatingPointMath {
+			if n := z.size.X * z.size.Y; n > cap(z.bufU32) {
+				z.bufU32 = make([]uint32, n)
+			} else {
+				z.bufU32 = z.bufU32[:n]
+			}
+			floatingAccumulateMaskEvenOdd(z.bufU32, z.bufF32, width)
+		} else {
+			fixedAccumulateMaskEvenOdd(z.bufU32, width)
+		}
+		return
+	}
+
 	if z.useFloatingPointMath {
 		if n := z.size.X * z.size.Y; n > cap(z.bufU32) {
 			z.bufU32 = make([]uint32, n)
@@ -321,10 +429,17 @@ func (z *Rasterizer) accumulateMask() {
 }
 
 func (z *Rasterizer) rasterizeDstAlphaSrcOpaqueOpOver(dst *image.Alpha, r image.Rectangle) {
-	// TODO: non-zero vs even-odd winding?
 	if r == dst.Bounds() && r == z.Bounds() {
 		// We bypass the z.accumulateMask step and convert straight from
 		// z.bufF32 or z.bufU32 to dst.Pix.
+		if z.FillRule == EvenOdd {
+			if z.useFloatingPointMath {
+				floatingAccumulateOpOverEvenOdd(dst.Pix, z.bufF32, int32(z.size.X))
+			} else {
+				fixedAccumulateOpOverEvenOdd(dst.Pix, z.bufU32, int32(z.size.X))
+			}
+			return
+		}
 		if z.useFloatingPointMath {
 			if haveAccumulateSIMD {
 				floatingAccumulateOpOverSIMD(dst.Pix, z.bufF32)
@@ -357,10 +472,17 @@ func (z *Rasterizer) rasterizeDstAlphaSrcOpaqueOpOver(dst *image.Alpha, r image.
 }
 
 func (z *Rasterizer) rasterizeDstAlphaSrcOpaqueOpSrc(dst *image.Alpha, r image.Rectangle) {
-	// TODO: non-zero vs even-odd winding?
 	if r == dst.Bounds() && r == z.Bounds() {
 		// We bypass the z.accumulateMask step and convert straight from
 		// z.bufF32 or z.bufU32 to dst.Pix.
+		if z.FillRule == EvenOdd {
+			if z.useFloatingPointMath {
+				floatingAccumulateOpSrcEvenOdd(dst.Pix, z.bufF32, int32(z.size.X))
+			} else {
+				fixedAccumulateOpSrcEvenOdd(dst.Pix, z.bufU32, int32(z.size.X))
+			}
+			return
+		}
 		if z.useFloatingPointMath {
 			if haveAccumulateSIMD {
 				floatingAccumulateOpSrcSIMD(dst.Pix, z.bufF32)

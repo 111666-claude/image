@@ -218,3 +218,85 @@ func floatingAccumulateMask(dst []uint32, src []float32) {
 		dst[i] = uint32(almost65536 * a)
 	}
 }
+
+// floatingFoldEvenOdd folds the signed winding number w onto the even-odd
+// triangle wave f(w) = 1 - |mod(w, 2) - 1|. The result is in the range
+// [0, 1].
+func floatingFoldEvenOdd(w float32) float32 {
+	m := float32(math.Mod(float64(w), 2))
+	if m < 0 {
+		m += 2
+	}
+	a := m - 1
+	if a < 0 {
+		a = -a
+	}
+	return 1 - a
+}
+
+// floatingAccumulateMaskEvenOdd is floatingAccumulateMask with the even-odd
+// rule. width is the rasterizer width: src is laid out as rows of width
+// samples, and the running sum restarts on each row.
+func floatingAccumulateMaskEvenOdd(dst []uint32, src []float32, width int32) {
+	// Sanity check that len(dst) >= len(src).
+	if len(dst) < len(src) || width <= 0 {
+		return
+	}
+
+	height := int32(len(src)) / width
+	for y := int32(0); y < height; y++ {
+		row := src[y*width : (y+1)*width]
+		acc := float32(0)
+		for i, v := range row {
+			acc += v
+			a := floatingFoldEvenOdd(acc)
+			dst[y*width+int32(i)] = uint32(almost65536 * a)
+		}
+	}
+}
+
+// floatingAccumulateOpSrcEvenOdd is floatingAccumulateOpSrc with the
+// even-odd rule.
+func floatingAccumulateOpSrcEvenOdd(dst []uint8, src []float32, width int32) {
+	// Sanity check that len(dst) >= len(src).
+	if len(dst) < len(src) || width <= 0 {
+		return
+	}
+
+	height := int32(len(src)) / width
+	for y := int32(0); y < height; y++ {
+		row := src[y*width : (y+1)*width]
+		acc := float32(0)
+		for i, v := range row {
+			acc += v
+			a := floatingFoldEvenOdd(acc)
+			dst[y*width+int32(i)] = uint8(almost256 * a)
+		}
+	}
+}
+
+// floatingAccumulateOpOverEvenOdd is floatingAccumulateOpOver with the
+// even-odd rule.
+func floatingAccumulateOpOverEvenOdd(dst []uint8, src []float32, width int32) {
+	// Sanity check that len(dst) >= len(src).
+	if len(dst) < len(src) || width <= 0 {
+		return
+	}
+
+	height := int32(len(src)) / width
+	for y := int32(0); y < height; y++ {
+		row := src[y*width : (y+1)*width]
+		acc := float32(0)
+		for i, v := range row {
+			acc += v
+			a := floatingFoldEvenOdd(acc)
+			// This algorithm comes from the standard library's image/draw
+			// package.
+			idx := y*width + int32(i)
+			dstA := uint32(dst[idx]) * 0x101
+			maskA := uint32(almost65536 * a)
+			outA := dstA*(0xffff-maskA)/0xffff + maskA
+			dst[idx] = uint8(outA >> 8)
+		}
+	}
+}
