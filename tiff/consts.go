@@ -29,10 +29,18 @@ const (
 	dtShort    = 3
 	dtLong     = 4
 	dtRational = 5
+	dtIFD      = 13 // A 32-bit offset to an IFD (TIFF Technical Note 1).
 )
 
 // The length of one instance of each data type in bytes.
-var lengths = [...]uint32{0, 1, 1, 2, 4, 8}
+var lengths = [dtIFD + 1]uint32{
+	dtByte:     1,
+	dtASCII:    1,
+	dtShort:    2,
+	dtLong:     4,
+	dtRational: 8,
+	dtIFD:      4,
+}
 
 // Tags (see p. 28-41 of the spec).
 const (
@@ -41,6 +49,7 @@ const (
 	tBitsPerSample             = 258
 	tCompression               = 259
 	tPhotometricInterpretation = 262
+	tImageDescription          = 270
 
 	tFillOrder = 266
 
@@ -48,6 +57,8 @@ const (
 	tSamplesPerPixel = 277
 	tRowsPerStrip    = 278
 	tStripByteCounts = 279
+
+	tNewSubfileType = 254
 
 	tT4Options = 292 // CCITT Group 3 options, a set of 32 flag bits.
 	tT6Options = 293 // CCITT Group 4 options, a set of 32 flag bits.
@@ -65,6 +76,8 @@ const (
 	tColorMap     = 320
 	tExtraSamples = 338
 	tSampleFormat = 339
+
+	tSubIFDs = 330 // Offsets to child IFDs (TIFF Technical Note 1).
 )
 
 // Compression types (defined in various places in the spec and supplements).

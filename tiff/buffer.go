@@ -4,7 +4,16 @@
 
 package tiff
 
-import "io"
+import (
+	"io"
+	"math"
+)
+
+// fillChunkSize bounds how much b.fill allocates and reads at once, so that a
+// hostile offset (for example a SubIFD offset near 2^32 in a tiny input) makes
+// fill read to the end of the input and fail, rather than allocating the whole
+// offset up front.
+const fillChunkSize = 10 << 20 // 10M
 
 // buffer buffers an io.Reader to satisfy io.ReaderAt.
 type buffer struct {
@@ -15,21 +24,25 @@ type buffer struct {
 // fill reads data from b.r until the buffer contains at least end bytes.
 func (b *buffer) fill(end int) error {
 	m := len(b.buf)
-	if end > m {
-		if end > cap(b.buf) {
-			newcap := 1024
-			for newcap < end {
-				newcap *= 2
-			}
-			newbuf := make([]byte, end, newcap)
-			copy(newbuf, b.buf)
-			b.buf = newbuf
-		} else {
-			b.buf = b.buf[:end]
+	for m < end {
+		next := end - m
+		if next > fillChunkSize {
+			next = fillChunkSize
 		}
-		if n, err := io.ReadFull(b.r, b.buf[m:end]); err != nil {
-			end = m + n
-			b.buf = b.buf[:end]
+		if m+next > cap(b.buf) {
+			newcap := cap(b.buf) * 2
+			if newcap < m+next {
+				newcap = m + next
+			}
+			newbuf := make([]byte, m, newcap)
+			copy(newbuf, b.buf[:m])
+			b.buf = newbuf
+		}
+		b.buf = b.buf[:m+next]
+		n, err := io.ReadFull(b.r, b.buf[m:m+next])
+		m += n
+		b.buf = b.buf[:m]
+		if err != nil {
 			return err
 		}
 	}
@@ -37,14 +50,24 @@ func (b *buffer) fill(end int) error {
 }
 
 func (b *buffer) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off > int64(math.MaxInt) {
+		return 0, io.ErrUnexpectedEOF
+	}
 	o := int(off)
 	end := o + len(p)
-	if int64(end) != off+int64(len(p)) {
+	if end < o {
 		return 0, io.ErrUnexpectedEOF
 	}
 
 	err := b.fill(end)
-	return copy(p, b.buf[o:end]), err
+	if o > len(b.buf) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.buf[o:])
+	if err == nil && n < len(p) {
+		err = io.EOF
+	}
+	return n, err
 }
 
 // Slice returns a slice of the underlying buffer. The slice contains

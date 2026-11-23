@@ -112,26 +112,40 @@ func (d *decoder) firstVal(tag int) uint {
 	return f[0]
 }
 
-// ifdUint decodes the IFD entry in p, which must be of the Byte, Short
-// or Long type, and returns the decoded uint values.
-func (d *decoder) ifdUint(p []byte) (u []uint, err error) {
+// ifdInfo is the parsed contents of one Image File Directory.
+type ifdInfo struct {
+	offset   int64
+	subIFDs  []int64 // Offsets stored in the SubIFDs tag, in file order.
+	features map[int][]uint
+	palette  []color.Color
+	desc     string // ImageDescription, if present.
+}
+
+// ifdUint decodes the IFD entry in p, which must be of the Byte, Short,
+// Long or IFD type, and returns the decoded uint values. The IFD type is only
+// accepted when allowIFD is true (for the SubIFDs tag); other tags reject it
+// exactly as before.
+func ifdUint(r io.ReaderAt, byteOrder binary.ByteOrder, p []byte, allowIFD bool) (u []uint, err error) {
 	var raw []byte
 	if len(p) < ifdLen {
 		return nil, FormatError("bad IFD entry")
 	}
 
-	datatype := d.byteOrder.Uint16(p[2:4])
-	if dt := int(datatype); dt <= 0 || dt >= len(lengths) {
+	datatype := byteOrder.Uint16(p[2:4])
+	if dt := int(datatype); dt <= 0 || dt >= len(lengths) || lengths[dt] == 0 {
 		return nil, UnsupportedError("IFD entry datatype")
 	}
+	if datatype == dtIFD && !allowIFD {
+		return nil, UnsupportedError("data type")
+	}
 
-	count := d.byteOrder.Uint32(p[4:8])
+	count := byteOrder.Uint32(p[4:8])
 	if count > math.MaxInt32/lengths[datatype] {
 		return nil, FormatError("IFD data too large")
 	}
 	if datalen := lengths[datatype] * count; datalen > 4 {
 		// The IFD contains a pointer to the real value.
-		raw, err = safeReadAt(d.r, uint64(datalen), int64(d.byteOrder.Uint32(p[8:12])))
+		raw, err = safeReadAt(r, uint64(datalen), int64(byteOrder.Uint32(p[8:12])))
 	} else {
 		raw = p[8 : 8+datalen]
 	}
@@ -147,11 +161,11 @@ func (d *decoder) ifdUint(p []byte) (u []uint, err error) {
 		}
 	case dtShort:
 		for i := uint32(0); i < count; i++ {
-			u[i] = uint(d.byteOrder.Uint16(raw[2*i : 2*(i+1)]))
+			u[i] = uint(byteOrder.Uint16(raw[2*i : 2*(i+1)]))
 		}
-	case dtLong:
+	case dtLong, dtIFD:
 		for i := uint32(0); i < count; i++ {
-			u[i] = uint(d.byteOrder.Uint32(raw[4*i : 4*(i+1)]))
+			u[i] = uint(byteOrder.Uint32(raw[4*i : 4*(i+1)]))
 		}
 	default:
 		return nil, UnsupportedError("data type")
@@ -159,11 +173,43 @@ func (d *decoder) ifdUint(p []byte) (u []uint, err error) {
 	return u, nil
 }
 
-// parseIFD decides whether the IFD entry in p is "interesting" and
-// stows away the data in the decoder. It returns the tag number of the
-// entry and an error, if any.
-func (d *decoder) parseIFD(p []byte) (int, error) {
-	tag := d.byteOrder.Uint16(p[0:2])
+// maxDescriptionLen bounds the ImageDescription text that enumeration will
+// read. The tag is informational, so a huge count is treated as absent rather
+// than as a reason to allocate a large buffer from untrusted metadata.
+const maxDescriptionLen = 64 << 10
+
+// ifdASCII decodes an ASCII IFD entry. It returns the empty string for entries
+// that are not ASCII or that are unreasonably large.
+func ifdASCII(r io.ReaderAt, byteOrder binary.ByteOrder, p []byte) (string, error) {
+	if len(p) < ifdLen || byteOrder.Uint16(p[2:4]) != dtASCII {
+		return "", nil
+	}
+	count := byteOrder.Uint32(p[4:8])
+	if count == 0 || count > maxDescriptionLen {
+		return "", nil
+	}
+	var raw []byte
+	var err error
+	if count <= 4 {
+		raw = p[8 : 8+count]
+	} else {
+		raw, err = safeReadAt(r, uint64(count), int64(byteOrder.Uint32(p[8:12])))
+	}
+	if err != nil {
+		return "", err
+	}
+	for len(raw) > 0 && raw[len(raw)-1] == 0 {
+		raw = raw[:len(raw)-1]
+	}
+	return string(raw), nil
+}
+
+// parseIFDEntry decides whether the IFD entry in p is "interesting" and stows
+// away the data in info. It returns the tag number of the entry and an error,
+// if any. If wantSubIFDs is false, the SubIFDs tag is ignored entirely, so
+// that decoding a main image is unaffected by a malformed associated IFD.
+func parseIFDEntry(r io.ReaderAt, byteOrder binary.ByteOrder, p []byte, info *ifdInfo, wantSubIFDs bool) (int, error) {
+	tag := byteOrder.Uint16(p[0:2])
 	switch tag {
 	case tBitsPerSample,
 		tExtraSamples,
@@ -182,13 +228,43 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tFillOrder,
 		tT4Options,
 		tT6Options:
-		val, err := d.ifdUint(p)
+		val, err := ifdUint(r, byteOrder, p, false)
 		if err != nil {
 			return 0, err
 		}
-		d.features[int(tag)] = val
+		info.features[int(tag)] = val
+	case tNewSubfileType, tSamplesPerPixel:
+		// These tags are informational to this package. Parse them when
+		// possible so enumeration can report them, but never let a malformed
+		// value reject a file that Decode accepted before.
+		if val, err := ifdUint(r, byteOrder, p, false); err == nil {
+			info.features[int(tag)] = val
+		}
+	case tSubIFDs:
+		if !wantSubIFDs {
+			break
+		}
+		// The SubIFDs tag is defined to hold LONG or IFD (13) values. Be
+		// strict here: an associated IFD with the wrong type cannot be
+		// located reliably.
+		if dt := byteOrder.Uint16(p[2:4]); dt != dtLong && dt != dtIFD {
+			return 0, fmt.Errorf("%w: SubIFDs tag has type %d, want LONG or IFD", ErrIFDType, dt)
+		}
+		val, err := ifdUint(r, byteOrder, p, true)
+		if err != nil {
+			return 0, err
+		}
+		info.subIFDs = make([]int64, len(val))
+		for i, v := range val {
+			info.subIFDs[i] = int64(v)
+		}
+		info.features[int(tag)] = val
+	case tImageDescription:
+		if desc, err := ifdASCII(r, byteOrder, p); err == nil {
+			info.desc = desc
+		}
 	case tColorMap:
-		val, err := d.ifdUint(p)
+		val, err := ifdUint(r, byteOrder, p, false)
 		if err != nil {
 			return 0, err
 		}
@@ -196,9 +272,9 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		if len(val)%3 != 0 || numcolors <= 0 || numcolors > 256 {
 			return 0, FormatError("bad ColorMap length")
 		}
-		d.palette = make([]color.Color, numcolors)
+		info.palette = make([]color.Color, numcolors)
 		for i := 0; i < numcolors; i++ {
-			d.palette[i] = color.RGBA64{
+			info.palette[i] = color.RGBA64{
 				uint16(val[i]),
 				uint16(val[i+numcolors]),
 				uint16(val[i+2*numcolors]),
@@ -210,17 +286,60 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		// the value is not 1 [= unsigned integer data], a Baseline
 		// TIFF reader that cannot handle the SampleFormat value
 		// must terminate the import process gracefully.
-		val, err := d.ifdUint(p)
+		//
+		// Keep the values so that IFD enumeration can describe a page
+		// that this package cannot decode; newDecoderFromIFD rejects
+		// them when a decode is actually attempted.
+		val, err := ifdUint(r, byteOrder, p, false)
 		if err != nil {
 			return 0, err
 		}
-		for _, v := range val {
-			if v != 1 {
-				return 0, UnsupportedError("sample format")
-			}
-		}
+		info.features[int(tag)] = val
 	}
 	return int(tag), nil
+}
+
+// readIFDAt reads and parses the IFD at offset. If wantSubIFDs is false, the
+// SubIFDs tag is ignored entirely and no associated IFDs are validated, so
+// that decoding a main image is unaffected by a malformed thumbnail; readers
+// that will enumerate the tree pass true.
+func readIFDAt(r io.ReaderAt, byteOrder binary.ByteOrder, offset int64, wantSubIFDs bool) (*ifdInfo, error) {
+	if offset < 0 {
+		return nil, FormatError("negative IFD offset")
+	}
+
+	// The first two bytes contain the number of entries (12 bytes each).
+	var p [2]byte
+	if _, err := r.ReadAt(p[:], offset); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	numItems := int(byteOrder.Uint16(p[:]))
+
+	// All IFD entries are read in one chunk.
+	data, err := safeReadAt(r, uint64(ifdLen)*uint64(numItems), offset+2)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &ifdInfo{
+		offset:   offset,
+		features: make(map[int][]uint),
+	}
+	prevTag := -1
+	for i := 0; i < len(data); i += ifdLen {
+		tag, err := parseIFDEntry(r, byteOrder, data[i:i+ifdLen], info, wantSubIFDs)
+		if err != nil {
+			return nil, err
+		}
+		if tag <= prevTag {
+			return nil, FormatError("tags are not sorted in ascending order")
+		}
+		prevTag = tag
+	}
+	return info, nil
 }
 
 // readBits reads n bits from the internal buffer starting at the current offset.
@@ -449,53 +568,53 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	return nil
 }
 
-func newDecoder(r io.Reader) (*decoder, error) {
-	d := &decoder{
-		r:        newReaderAt(r),
-		features: make(map[int][]uint),
+// readHeader reads the TIFF file header and returns the underlying ReaderAt,
+// the file's byte order and the offset of the first IFD.
+func readHeader(r io.Reader) (io.ReaderAt, binary.ByteOrder, int64, error) {
+	ra := newReaderAt(r)
+	byteOrder, ifdOffset, err := readHeaderFrom(ra)
+	if err != nil {
+		return nil, nil, 0, err
 	}
+	return ra, byteOrder, ifdOffset, nil
+}
 
+// readHeaderFrom reads the TIFF file header from ra.
+func readHeaderFrom(ra io.ReaderAt) (binary.ByteOrder, int64, error) {
 	p := make([]byte, 8)
-	if _, err := d.r.ReadAt(p, 0); err != nil {
+	if _, err := ra.ReadAt(p, 0); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, err
+		return nil, 0, err
 	}
+
+	var byteOrder binary.ByteOrder
 	switch string(p[0:4]) {
 	case leHeader:
-		d.byteOrder = binary.LittleEndian
+		byteOrder = binary.LittleEndian
 	case beHeader:
-		d.byteOrder = binary.BigEndian
+		byteOrder = binary.BigEndian
 	default:
-		return nil, FormatError("malformed header")
+		return nil, 0, FormatError("malformed header")
 	}
+	return byteOrder, int64(byteOrder.Uint32(p[4:8])), nil
+}
 
-	ifdOffset := int64(d.byteOrder.Uint32(p[4:8]))
-
-	// The first two bytes contain the number of entries (12 bytes each).
-	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
-		return nil, err
+// newDecoderFromIFD returns a decoder for the image described by info. The
+// decoder takes a private copy of info's tag values, so it never modifies the
+// IFD it was built from.
+func newDecoderFromIFD(r io.ReaderAt, byteOrder binary.ByteOrder, info *ifdInfo) (*decoder, error) {
+	d := &decoder{
+		r:         r,
+		byteOrder: byteOrder,
+		features:  make(map[int][]uint, len(info.features)),
 	}
-	numItems := int(d.byteOrder.Uint16(p[0:2]))
-
-	// All IFD entries are read in one chunk.
-	var err error
-	p, err = safeReadAt(d.r, uint64(ifdLen*numItems), ifdOffset+2)
-	if err != nil {
-		return nil, err
+	for tag, v := range info.features {
+		d.features[tag] = append([]uint(nil), v...)
 	}
-
-	prevTag := -1
-	for i := 0; i < len(p); i += ifdLen {
-		tag, err := d.parseIFD(p[i : i+ifdLen])
-		if err != nil {
-			return nil, err
-		}
-		if tag <= prevTag {
-			return nil, FormatError("tags are not sorted in ascending order")
-		}
-		prevTag = tag
+	if len(info.palette) != 0 {
+		d.palette = append([]color.Color(nil), info.palette...)
 	}
 
 	d.config.Width = int(d.firstVal(tImageWidth))
@@ -513,6 +632,17 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		// Nothing to do, these are accepted by this implementation.
 	default:
 		return nil, UnsupportedError(fmt.Sprintf("BitsPerSample of %v", d.bpp))
+	}
+
+	// Page 27 of the spec: If the SampleFormat is present and the value is
+	// not 1 [= unsigned integer data], a Baseline TIFF reader that cannot
+	// handle the SampleFormat value must terminate the import process
+	// gracefully. Enumerating IFDs does not decode, so this check lives here
+	// rather than in the IFD parser.
+	for _, v := range d.features[tSampleFormat] {
+		if v != 1 {
+			return nil, UnsupportedError("sample format")
+		}
 	}
 
 	// Determine the image mode.
@@ -596,6 +726,18 @@ func newDecoder(r io.Reader) (*decoder, error) {
 	return d, nil
 }
 
+func newDecoder(r io.Reader) (*decoder, error) {
+	ra, byteOrder, ifdOffset, err := readHeader(r)
+	if err != nil {
+		return nil, err
+	}
+	info, err := readIFDAt(ra, byteOrder, ifdOffset, false)
+	if err != nil {
+		return nil, err
+	}
+	return newDecoderFromIFD(ra, byteOrder, info)
+}
+
 // DecodeConfig returns the color model and dimensions of a TIFF image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
@@ -616,9 +758,22 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 // Decode reads a TIFF image from r and returns it as an image.Image.
 // The type of Image returned depends on the contents of the TIFF.
 func Decode(r io.Reader) (img image.Image, err error) {
-	d, err := newDecoder(r)
+	ra, byteOrder, ifdOffset, err := readHeader(r)
 	if err != nil {
-		return
+		return nil, err
+	}
+	info, err := readIFDAt(ra, byteOrder, ifdOffset, false)
+	if err != nil {
+		return nil, err
+	}
+	return decodeIFD(ra, byteOrder, info)
+}
+
+// decodeIFD decodes the image described by info from r.
+func decodeIFD(r io.ReaderAt, byteOrder binary.ByteOrder, info *ifdInfo) (img image.Image, err error) {
+	d, err := newDecoderFromIFD(r, byteOrder, info)
+	if err != nil {
+		return nil, err
 	}
 
 	blockPadding := false
@@ -702,7 +857,7 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	}
 
 	if blocksAcross == 0 || blocksDown == 0 {
-		return
+		return img, nil
 	}
 	// Maximum data per pixel is 8 bytes (RGBA64).
 	blockMaxDataSize := int64(blockWidth) * int64(blockHeight) * 8
@@ -770,7 +925,7 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			}
 		}
 	}
-	return
+	return img, nil
 }
 
 func readBuf(r io.Reader, buf []byte, lim int64) ([]byte, error) {
