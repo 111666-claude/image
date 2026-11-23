@@ -57,6 +57,55 @@ type Transformer interface {
 	Transform(dst Image, m f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options)
 }
 
+// TransferFunction selects the color space in which Kernel filters pixels.
+//
+// The sRGB transfer function is the convention used by the image package: an
+// 8 or 16 bit color channel represents an sRGB-encoded value, not a value
+// proportional to physical light intensity. Filtering such values directly
+// (the default) is cheap and matches the other interpolators in this package,
+// but it makes intermediate results too dark. In particular, averaging black
+// and white in sRGB-encoded space gives roughly 0.5, which is much darker than
+// the roughly 0.21 that averaging in linear light gives.
+type TransferFunction uint8
+
+const (
+	// TransferSRGB (the zero value) filters color channels as stored, in
+	// sRGB-encoded space. It is the behavior of a Kernel with a nil *Options
+	// and of the other interpolators in this package.
+	TransferSRGB TransferFunction = iota
+
+	// TransferLinear filters color channels in linear light, converting from
+	// and back to the sRGB encoding with the standard piecewise transfer
+	// function. Alpha is linear coverage and is not affected by the transfer
+	// function.
+	//
+	// Values outside the nominal [0, 1] range (for example, intermediate
+	// results of a kernel with negative lobes) are transferred by extending
+	// the sRGB curve oddly around zero: f(-v) = -f(v). The final output is
+	// clamped to [0, 1]. This keeps the transfer function monotonic and
+	// invertible over the whole real line.
+	TransferLinear
+)
+
+// AlphaMode selects how Kernel filters alpha.
+type AlphaMode uint8
+
+const (
+	// AlphaPremultiplied (the zero value) filters alpha-premultiplied color,
+	// which is what Porter-Duff compositing and the other interpolators in
+	// this package use. Translucent source pixels contribute in proportion to
+	// their alpha, so fully transparent pixels cannot tint their neighbors.
+	AlphaPremultiplied AlphaMode = iota
+
+	// AlphaStraight filters unassociated (straight) color and alpha
+	// independently, then multiplies by the filtered alpha on output. This
+	// preserves the color of pixels whose alpha is zero, at the cost of color
+	// bleeding from transparent or nearly transparent pixels into opaque
+	// ones. It is mostly useful for comparing against software that resamples
+	// straight alpha.
+	AlphaStraight
+)
+
 // Options are optional parameters to Copy, Scale and Transform.
 //
 // A nil *Options means to use the default (zero) values of each field.
@@ -90,6 +139,20 @@ type Options struct {
 	DstMaskP image.Point
 	SrcMask  image.Image
 	SrcMaskP image.Point
+
+	// Transfer selects the color space in which Kernel filtering happens.
+	// The zero value, TransferSRGB, filters encoded channels directly, which
+	// is the historical behavior.
+	//
+	// TransferLinear does not affect NearestNeighbor, ApproxBiLinear or Copy,
+	// which do not blend more than a few neighboring pixels; it applies to
+	// Kernel's Scale and Transform. A non-Kernel Interpolator ignores it.
+	Transfer TransferFunction
+
+	// Alpha selects whether Kernel filtering operates on premultiplied or
+	// straight color. The zero value, AlphaPremultiplied, matches the rest of
+	// this package.
+	Alpha AlphaMode
 
 	// TODO: a smooth vs sharp edges option, for arbitrary rotations?
 }

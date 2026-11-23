@@ -116,3 +116,22 @@ func ExampleDraw() {
 	// Output:
 	// dst has bounds (0,0)-(400,300).
 }
+
+// ExampleOptions_transfer demonstrates filtering in linear light. A two-pixel
+// black-and-white source scaled down to one pixel averages to 0.5 in linear
+// light, which is about 0.735 once encoded back to sRGB. Filtering the encoded
+// values directly would give 0.5 encoded, which is visibly too dark.
+func ExampleOptions_transfer() {
+	src := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	src.SetNRGBA(0, 0, color.NRGBA{0x00, 0x00, 0x00, 0xff})
+	src.SetNRGBA(1, 0, color.NRGBA{0xff, 0xff, 0xff, 0xff})
+
+	dst := image.NewRGBA64(image.Rect(0, 0, 1, 1))
+	draw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Src, &draw.Options{
+		Transfer: draw.TransferLinear,
+	})
+
+	fmt.Printf("gray = %.3f\n", float64(dst.RGBA64At(0, 0).R)/0xffff)
+	// Output:
+	// gray = 0.735
+}

@@ -1327,6 +1327,15 @@ const (
 				op = Src
 			}
 
+			// Linear-light filtering and straight-alpha filtering are
+			// implemented by a hand-written path. The generated fast paths
+			// below implement the default (sRGB, premultiplied) behavior and
+			// must be preserved bit-for-bit.
+			if o.Transfer == TransferLinear || o.Alpha == AlphaStraight {
+				z.scaleLinear(dst, dr, adr, src, sr, op, &o)
+				return
+			}
+
 			if _, ok := src.(*image.Uniform); ok && o.DstMask == nil && o.SrcMask == nil && sr.In(src.Bounds()) {
 				Draw(dst, dr, src, src.Bounds().Min, op)
 				return
@@ -1398,6 +1407,15 @@ const (
 			d2s[5] -= float64(bias.Y)
 			// Make adr relative to dr.Min.
 			adr = adr.Sub(dr.Min)
+
+			// Linear-light filtering and straight-alpha filtering are
+			// implemented by a hand-written path. The generated fast paths
+			// below implement the default (sRGB, premultiplied) behavior and
+			// must be preserved bit-for-bit.
+			if o.Transfer == TransferLinear || o.Alpha == AlphaStraight {
+				q.transformLinear(dst, dr, adr, &d2s, src, sr, bias, op, &o)
+				return
+			}
 
 			if u, ok := src.(*image.Uniform); ok && o.DstMask != nil && o.SrcMask != nil && sr.In(src.Bounds()) {
 				transform_Uniform(dst, dr, adr, &d2s, u, sr, bias, op)
