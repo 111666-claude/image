@@ -221,6 +221,23 @@ func expnDollar(prefix, dollar, suffix string, d *data) string {
 	case "op":
 		return prefix + d.op + suffix
 
+	case "scaleBoundary":
+		switch d.receiver {
+		case "nnInterpolator":
+			return prefix + "nnScaleBoundary(dst, dr, src, sr, op, opts); return" + suffix
+		case "ablInterpolator":
+			return prefix + "ablScaleBoundary(dst, dr, src, sr, op, opts); return" + suffix
+		}
+		return prefix + "kernelScaleBoundary(z.kernel, dst, dr, src, sr, op, opts); return" + suffix
+	case "tformBoundary":
+		switch d.receiver {
+		case "nnInterpolator":
+			return prefix + "nnTransformBoundary(dst, s2d, src, sr, op, opts); return" + suffix
+		case "ablInterpolator":
+			return prefix + "ablTransformBoundary(dst, s2d, src, sr, op, opts); return" + suffix
+		}
+		return prefix + "kernelTransformBoundary(z.kernel, dst, s2d, src, sr, op, opts); return" + suffix
+
 	case "switch":
 		return expnSwitch("", "", true, suffix)
 	case "switchD":
@@ -1048,6 +1065,17 @@ func relName(s string) string {
 const (
 	codeRoot = `
 		func (z $receiver) Scale(dst Image, dr image.Rectangle, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			var o0 Options
+			if opts != nil {
+				o0 = *opts
+			}
+			// Non-default boundary modes use the self-contained,
+			// bounds-checked samplers in boundary.go. BoundaryClamp (the
+			// zero value) keeps the generated fast paths below unchanged.
+			if normalizeBoundary(o0.Boundary) != BoundaryClamp {
+				$scaleBoundary
+			}
+
 			// Try to simplify a Scale to a Copy when DstMask is not specified.
 			// If DstMask is not nil, Copy will call Scale back with same dr and sr, and cause stack overflow.
 			if dr.Size() == sr.Size() && (opts == nil || opts.DstMask == nil) {
@@ -1092,6 +1120,23 @@ const (
 		}
 
 		func (z $receiver) Transform(dst Image, s2d f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			var o0 Options
+			if opts != nil {
+				o0 = *opts
+			}
+			// Non-default boundary modes use the self-contained,
+			// bounds-checked samplers in boundary.go. BoundaryClamp (the
+			// zero value) keeps the generated fast paths below unchanged.
+			if normalizeBoundary(o0.Boundary) != BoundaryClamp {
+				$tformBoundary
+			}
+			// A non-finite matrix has no defined source coordinates; the
+			// inverse would contain NaN/Inf and produce undefined samples, so
+			// skip safely instead.
+			if !aff3Finite(&s2d) {
+				return
+			}
+
 			// Try to simplify a Transform to a Copy.
 			if s2d[0] == 1 && s2d[1] == 0 && s2d[3] == 0 && s2d[4] == 1 {
 				dx := int(s2d[2])
@@ -1305,6 +1350,18 @@ const (
 
 	codeKernelRoot = `
 		func (z *kernelScaler) Scale(dst Image, dr image.Rectangle, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			var o0 Options
+			if opts != nil {
+				o0 = *opts
+			}
+			// Non-default boundary modes use the self-contained,
+			// bounds-checked 2D sampler in boundary.go rather than the
+			// precomputed (clamp-only) distrib tables.
+			if normalizeBoundary(o0.Boundary) != BoundaryClamp {
+				kernelScaleBoundary(z.kernel, dst, dr, src, sr, op, opts)
+				return
+			}
+
 			if z.dw != int32(dr.Dx()) || z.dh != int32(dr.Dy()) || z.sw != int32(sr.Dx()) || z.sh != int32(sr.Dy()) {
 				z.kernel.Scale(dst, dr, src, sr, op, opts)
 				return
@@ -1368,6 +1425,22 @@ const (
 		}
 
 		func (q *Kernel) Transform(dst Image, s2d f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			var o0 Options
+			if opts != nil {
+				o0 = *opts
+			}
+			// Non-default boundary modes use the self-contained,
+			// bounds-checked sampler in boundary.go.
+			if normalizeBoundary(o0.Boundary) != BoundaryClamp {
+				kernelTransformBoundary(q, dst, s2d, src, sr, op, opts)
+				return
+			}
+			// A non-finite matrix has no defined source coordinates; skip
+			// safely instead of inverting it.
+			if !aff3Finite(&s2d) {
+				return
+			}
+
 			var o Options
 			if opts != nil {
 				o = *opts

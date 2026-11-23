@@ -91,8 +91,51 @@ type Options struct {
 	SrcMask  image.Image
 	SrcMaskP image.Point
 
+	// Boundary configures how a Scale or Transform samples a source
+	// coordinate that falls outside the source rectangle sr. It has no
+	// effect on Copy, which maps source and destination pixels 1:1 and
+	// therefore never samples outside the source rectangle.
+	//
+	// The zero value, BoundaryClamp, preserves the historical behavior of
+	// the NearestNeighbor, ApproxBiLinear and Kernel interpolators. The
+	// other modes are opt-in and take effect for Scale and Transform calls
+	// made through any Interpolator.
+	Boundary BoundaryMode
+
 	// TODO: a smooth vs sharp edges option, for arbitrary rotations?
 }
+
+// BoundaryMode selects how an Interpolator behaves when a source coordinate
+// lies outside the source rectangle passed to Scale or Transform.
+type BoundaryMode uint8
+
+const (
+	// BoundaryClamp clamps out-of-range coordinates to the nearest edge
+	// pixel. It is the zero value and reproduces the interpolators'
+	// historical behavior.
+	BoundaryClamp BoundaryMode = iota
+
+	// BoundaryWrap repeats the source image periodically, as if tiled.
+	BoundaryWrap
+
+	// BoundaryMirror repeats the source image periodically, alternating
+	// between the original and a mirrored copy.
+	BoundaryMirror
+
+	// BoundaryTransparent treats every out-of-range coordinate as
+	// transparent black. With Op Src the matching destination pixel is
+	// set to transparent black; with Op Over it is left untouched.
+	BoundaryTransparent
+)
+
+// maxKernelSpan bounds the effective, downscale-broadened kernel support on
+// a single axis, measured in source-pixel taps. Without it, a pathologically
+// large Kernel.Support (or an extreme downscale ratio) would try to iterate
+// over an unbounded number of taps. When the span would exceed this many
+// source pixels on an axis, the support is shortened to the cap, which is a
+// safe degradation that keeps every read in range and the per-pixel work
+// bounded. Realistic images and kernels never reach the cap.
+const maxKernelSpan = 1 << 12
 
 // Interpolator is an interpolation algorithm, when dst and src pixels don't
 // have a 1:1 correspondence.
@@ -238,6 +281,13 @@ func newDistrib(q *Kernel, dw, sw int32) distrib {
 	if scale > 1 {
 		halfWidth *= scale
 		kernelArgScale = 1 / scale
+	}
+	// Bound the effective support so a pathological Kernel.Support, or an
+	// extreme downscale ratio, cannot make the contribs allocation overflow.
+	// This mirrors effectiveHalfWidth used by the boundary-mode samplers.
+	if math.IsNaN(halfWidth) || math.IsInf(halfWidth, 0) ||
+		int(math.Ceil(2*halfWidth)) > maxKernelSpan {
+		halfWidth = float64(maxKernelSpan) / 2
 	}
 
 	// Make the sources slice, one source for each column or row, and temporarily
@@ -522,4 +572,77 @@ func opaque(m image.Image) bool {
 		Opaque() bool
 	})
 	return ok && o.Opaque()
+}
+
+// aff3Finite reports whether every element of m is a finite float64 (not
+// NaN, +Inf or -Inf). A transform built from a non-finite matrix has no
+// well-defined source coordinate, so the call is safely skipped instead of
+// being sampled.
+func aff3Finite(m *f64.Aff3) bool {
+	for _, e := range m {
+		if math.IsNaN(e) || math.IsInf(e, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeBoundary maps an out-of-range BoundaryMode to the default
+// BoundaryClamp. This keeps a malformed (future) value from silently
+// producing an unexpected blank image.
+func normalizeBoundary(b BoundaryMode) BoundaryMode {
+	if b > BoundaryTransparent {
+		return BoundaryClamp
+	}
+	return b
+}
+
+// boundaryIndex maps a source-space integer coordinate p, relative to the
+// source rectangle [lo, hi), according to mode. The returned coordinate is
+// always in [lo, hi). ok is false only for BoundaryTransparent when p is
+// outside the rectangle, in which case the caller must treat the sample as
+// transparent black instead of reading the source image.
+//
+// n is the width or height of the source rectangle. An empty axis (n <= 0)
+// has no in-range pixels, so every coordinate is transparent and the
+// in-range modes collapse to lo.
+func boundaryIndex(mode BoundaryMode, p, lo, hi, n int) (q int, ok bool) {
+	if n <= 0 {
+		return lo, false
+	}
+	if p >= lo && p < hi {
+		return p, true
+	}
+	switch mode {
+	case BoundaryWrap:
+		// Express p relative to lo so the modulo arithmetic works on a
+		// rectangle that does not start at the origin.
+		r := (p - lo) % n
+		if r < 0 {
+			r += n
+		}
+		return lo + r, true
+
+	case BoundaryMirror:
+		// A mirrored period spans 2*n cells: 0..n-1 forward, then
+		// n..2n-1 reflected.
+		m := 2 * n
+		r := (p - lo) % m
+		if r < 0 {
+			r += m
+		}
+		if r >= n {
+			r = m - 1 - r
+		}
+		return lo + r, true
+
+	case BoundaryTransparent:
+		return lo, false
+
+	default: // BoundaryClamp, including any normalized unknown value.
+		if p < lo {
+			return lo, true
+		}
+		return hi - 1, true
+	}
 }
