@@ -86,6 +86,8 @@ const (
 	maxNumFontDicts           = 256
 	maxNumFonts               = 256
 	maxNumTables              = 256
+	maxNumVariationAxes       = 256
+	maxNumVariationInstances  = 4096
 	maxRealNumberStrLen       = 64 // Maximum length in bytes of the "-123.456E-7" representation.
 
 	// (maxTableOffset + maxTableLength) will not overflow an int32.
@@ -106,6 +108,7 @@ var (
 	errInvalidDfont           = errors.New("sfnt: invalid dfont")
 	errInvalidFont            = errors.New("sfnt: invalid font")
 	errInvalidFontCollection  = errors.New("sfnt: invalid font collection")
+	errInvalidFvarTable       = errors.New("sfnt: invalid fvar table")
 	errInvalidGPOSTable       = errors.New("sfnt: invalid GPOS table")
 	errInvalidGlyphData       = errors.New("sfnt: invalid glyph data")
 	errInvalidGlyphDataLength = errors.New("sfnt: invalid glyph data length")
@@ -125,28 +128,31 @@ var (
 	errInvalidTableTagOrder   = errors.New("sfnt: invalid table tag order")
 	errInvalidUCS2String      = errors.New("sfnt: invalid UCS-2 string")
 
-	errUnsupportedCFFFDSelectTable     = errors.New("sfnt: unsupported CFF FDSelect table")
-	errUnsupportedCFFVersion           = errors.New("sfnt: unsupported CFF version")
-	errUnsupportedClassDefFormat       = errors.New("sfnt: unsupported class definition format")
-	errUnsupportedCmapEncodings        = errors.New("sfnt: unsupported cmap encodings")
-	errUnsupportedCollection           = errors.New("sfnt: unsupported collection")
-	errUnsupportedCompoundGlyph        = errors.New("sfnt: unsupported compound glyph")
-	errUnsupportedCoverageFormat       = errors.New("sfnt: unsupported coverage format")
-	errUnsupportedExtensionPosFormat   = errors.New("sfnt: unsupported extension positioning format")
-	errUnsupportedGPOSTable            = errors.New("sfnt: unsupported GPOS table")
-	errUnsupportedGlyphDataLength      = errors.New("sfnt: unsupported glyph data length")
-	errUnsupportedKernTable            = errors.New("sfnt: unsupported kern table")
-	errUnsupportedNumberOfCmapSegments = errors.New("sfnt: unsupported number of cmap segments")
-	errUnsupportedNumberOfFontDicts    = errors.New("sfnt: unsupported number of font dicts")
-	errUnsupportedNumberOfFonts        = errors.New("sfnt: unsupported number of fonts")
-	errUnsupportedNumberOfHints        = errors.New("sfnt: unsupported number of hints")
-	errUnsupportedNumberOfSubroutines  = errors.New("sfnt: unsupported number of subroutines")
-	errUnsupportedNumberOfTables       = errors.New("sfnt: unsupported number of tables")
-	errUnsupportedPlatformEncoding     = errors.New("sfnt: unsupported platform encoding")
-	errUnsupportedPostTable            = errors.New("sfnt: unsupported post table")
-	errUnsupportedRealNumberEncoding   = errors.New("sfnt: unsupported real number encoding")
-	errUnsupportedTableOffsetLength    = errors.New("sfnt: unsupported table offset or length")
-	errUnsupportedType2Charstring      = errors.New("sfnt: unsupported Type 2 Charstring")
+	errUnsupportedCFFFDSelectTable           = errors.New("sfnt: unsupported CFF FDSelect table")
+	errUnsupportedCFFVersion                 = errors.New("sfnt: unsupported CFF version")
+	errUnsupportedClassDefFormat             = errors.New("sfnt: unsupported class definition format")
+	errUnsupportedCmapEncodings              = errors.New("sfnt: unsupported cmap encodings")
+	errUnsupportedCollection                 = errors.New("sfnt: unsupported collection")
+	errUnsupportedCompoundGlyph              = errors.New("sfnt: unsupported compound glyph")
+	errUnsupportedCoverageFormat             = errors.New("sfnt: unsupported coverage format")
+	errUnsupportedExtensionPosFormat         = errors.New("sfnt: unsupported extension positioning format")
+	errUnsupportedFvarTable                  = errors.New("sfnt: unsupported fvar table")
+	errUnsupportedGPOSTable                  = errors.New("sfnt: unsupported GPOS table")
+	errUnsupportedGlyphDataLength            = errors.New("sfnt: unsupported glyph data length")
+	errUnsupportedKernTable                  = errors.New("sfnt: unsupported kern table")
+	errUnsupportedNumberOfCmapSegments       = errors.New("sfnt: unsupported number of cmap segments")
+	errUnsupportedNumberOfFontDicts          = errors.New("sfnt: unsupported number of font dicts")
+	errUnsupportedNumberOfFonts              = errors.New("sfnt: unsupported number of fonts")
+	errUnsupportedNumberOfHints              = errors.New("sfnt: unsupported number of hints")
+	errUnsupportedNumberOfSubroutines        = errors.New("sfnt: unsupported number of subroutines")
+	errUnsupportedNumberOfTables             = errors.New("sfnt: unsupported number of tables")
+	errUnsupportedNumberOfVariationAxes      = errors.New("sfnt: unsupported number of variation axes")
+	errUnsupportedNumberOfVariationInstances = errors.New("sfnt: unsupported number of variation instances")
+	errUnsupportedPlatformEncoding           = errors.New("sfnt: unsupported platform encoding")
+	errUnsupportedPostTable                  = errors.New("sfnt: unsupported post table")
+	errUnsupportedRealNumberEncoding         = errors.New("sfnt: unsupported real number encoding")
+	errUnsupportedTableOffsetLength          = errors.New("sfnt: unsupported table offset or length")
+	errUnsupportedType2Charstring            = errors.New("sfnt: unsupported Type 2 Charstring")
 )
 
 // GlyphIndex is a glyph index in a Font.
@@ -656,6 +662,10 @@ type Font struct {
 	// TODO: hdmx, vmtx? Others?
 	kern table
 
+	// https://www.microsoft.com/typography/otspec/otff.htm#otttables
+	// "Font Variations".
+	fvar table
+
 	cached struct {
 		ascent           int32
 		capHeight        int32
@@ -676,6 +686,10 @@ type Font struct {
 		slope            [2]int32
 		unitsPerEm       Units
 		xHeight          int32
+
+		variationAxes      []VariationAxis
+		variationInstances []VariationInstance
+		variationErr       error
 	}
 }
 
@@ -742,6 +756,10 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
+	// A malformed fvar table does not prevent the font from being used as a
+	// fixed font, so its error is cached, not returned. The VariationAxes
+	// and VariationInstances methods report it.
+	buf, variationAxes, variationInstances, variationErr := f.parseFvar(buf)
 
 	f.cached.ascent = ascent
 	f.cached.capHeight = capHeight
@@ -762,6 +780,10 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.slope = [2]int32{run, rise}
 	f.cached.unitsPerEm = unitsPerEm
 	f.cached.xHeight = xHeight
+
+	f.cached.variationAxes = variationAxes
+	f.cached.variationInstances = variationInstances
+	f.cached.variationErr = variationErr
 
 	if !hasXHeightCapHeight {
 		xh, ch, err := f.initOS2VersionBelow2()
@@ -855,6 +877,8 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, finalTab
 			f.os2 = table{o, n}
 		case 0x636d6170:
 			f.cmap = table{o, n}
+		case 0x66766172:
+			f.fvar = table{o, n}
 		case 0x676c7966:
 			f.glyf = table{o, n}
 		case 0x47504f53:
