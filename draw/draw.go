@@ -21,6 +21,10 @@ import (
 
 // Draw calls DrawMask with a nil mask.
 func Draw(dst Image, r image.Rectangle, src image.Image, sp image.Point, op Op) {
+	if porterDuffOp(op) {
+		drawMaskPorterDuff(dst, r, src, sp, nil, image.Point{}, op)
+		return
+	}
 	draw.Draw(dst, r, src, sp, draw.Op(op))
 }
 
@@ -28,6 +32,10 @@ func Draw(dst Image, r image.Rectangle, src image.Image, sp image.Point, op Op) 
 // replaces the rectangle r in dst with the result of a Porter-Duff
 // composition. A nil mask is treated as opaque.
 func DrawMask(dst Image, r image.Rectangle, src image.Image, sp image.Point, mask image.Image, mp image.Point, op Op) {
+	if porterDuffOp(op) {
+		drawMaskPorterDuff(dst, r, src, sp, mask, mp, op)
+		return
+	}
 	draw.DrawMask(dst, r, src, sp, mask, mp, draw.Op(op))
 }
 
@@ -61,6 +69,40 @@ const (
 	Over Op = draw.Over
 	// Src specifies ``src in mask''.
 	Src Op = draw.Src
+
+	// SrcIn specifies ``(src in mask) in dst'': the part of the source
+	// lying inside the destination's alpha. The result's color and alpha
+	// are the source's, scaled by the destination's alpha.
+	//
+	// SrcIn is not provided by the standard library's image/draw package.
+	// It is supported by this package's Draw, DrawMask, Copy, Scale and
+	// Transform.
+	SrcIn Op = 2
+	// SrcOut specifies ``(src in mask) out dst'': the part of the source
+	// lying outside the destination's alpha. The result's color and alpha
+	// are the source's, scaled by one minus the destination's alpha.
+	//
+	// SrcOut is not provided by the standard library's image/draw package.
+	// It is supported by this package's Draw, DrawMask, Copy, Scale and
+	// Transform.
+	SrcOut Op = 3
+	// Atop specifies ``(src in mask) atop dst'': the part of the source
+	// lying inside the destination's alpha, plus the part of the
+	// destination lying outside the source's alpha. The result's alpha
+	// equals the destination's alpha.
+	//
+	// Atop is not provided by the standard library's image/draw package.
+	// It is supported by this package's Draw, DrawMask, Copy, Scale and
+	// Transform.
+	Atop Op = 4
+	// Xor specifies ``(src in mask) xor dst'': the part of the source
+	// lying outside the destination's alpha, plus the part of the
+	// destination lying outside the source's alpha.
+	//
+	// Xor is not provided by the standard library's image/draw package.
+	// It is supported by this package's Draw, DrawMask, Copy, Scale and
+	// Transform.
+	Xor Op = 5
 )
 
 // Quantizer produces a palette for an image.

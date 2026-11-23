@@ -1055,6 +1055,13 @@ const (
 				return
 			}
 
+			// The additional Porter-Duff operators are implemented by
+			// compositing a scaled copy of the source image.
+			if op != Over && op != Src {
+				scalePorterDuff(z, dst, dr, src, sr, op, opts)
+				return
+			}
+
 			var o Options
 			if opts != nil {
 				o = *opts
@@ -1100,6 +1107,13 @@ const (
 					Copy(dst, image.Point{X: sr.Min.X + dx, Y: sr.Min.X + dy}, src, sr, op, opts)
 					return
 				}
+			}
+
+			// The additional Porter-Duff operators are implemented by
+			// compositing a transformed copy of the source image.
+			if op != Over && op != Src {
+				transformPorterDuff(z, dst, s2d, src, sr, op, opts)
+				return
 			}
 
 			var o Options
@@ -1310,6 +1324,13 @@ const (
 				return
 			}
 
+			// The additional Porter-Duff operators are implemented by
+			// compositing a scaled copy of the source image.
+			if op != Over && op != Src {
+				scalePorterDuff(z, dst, dr, src, sr, op, opts)
+				return
+			}
+
 			var o Options
 			if opts != nil {
 				o = *opts
@@ -1368,6 +1389,13 @@ const (
 		}
 
 		func (q *Kernel) Transform(dst Image, s2d f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			// The additional Porter-Duff operators are implemented by
+			// compositing a transformed copy of the source image.
+			if op != Over && op != Src {
+				transformPorterDuff(q, dst, s2d, src, sr, op, opts)
+				return
+			}
+
 			var o Options
 			if opts != nil {
 				o = *opts
