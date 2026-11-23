@@ -48,6 +48,22 @@ import (
 // would still produce acceptable quality, but 512 seems to work.
 const floatingPointMathThreshold = 512
 
+const (
+	// DefaultFlattenTolerance is the default value of
+	// Rasterizer.FlattenTolerance: the maximum distance, in pixels, between
+	// a Bézier curve and the polyline it is flattened into.
+	//
+	// The value is 1/(4·√3) ≈ 0.144 pixels, which reproduces the historical
+	// flattening behavior of this package (subdividing when devSquared
+	// reaches 1/3 into 1 + (3·devSquared)^(1/4) segments).
+	DefaultFlattenTolerance = 0.14433756729740643
+
+	// DefaultMaxFlattenPoints is the default value of
+	// Rasterizer.MaxFlattenPoints: the maximum number of line segments (and
+	// hence points) that a single QuadTo or CubeTo call is flattened into.
+	DefaultMaxFlattenPoints = 4096
+)
+
 func lerp(t, px, py, qx, qy float32) (x, y float32) {
 	return px + t*(qx-px), py + t*(qy-py)
 }
@@ -105,13 +121,43 @@ type Rasterizer struct {
 	// The zero value is draw.Over.
 	DrawOp draw.Op
 
+	// FlattenTolerance is the maximum allowed distance, in pixels, between
+	// a Bézier curve and the polyline it is flattened into before
+	// rasterization. Smaller values give smoother curves at the cost of
+	// more line segments. It applies uniformly to QuadTo and CubeTo; LineTo
+	// and ClosePath are unaffected, so straight segments are never
+	// subdivided and closed paths keep their direction.
+	//
+	// The tolerance is in the same coordinate space as the XxxTo arguments,
+	// that is, device (raster) pixels after any user-supplied transform has
+	// been applied. Callers rendering at a higher device resolution (such
+	// as a HiDPI scale factor) should set this to the pixel error they can
+	// accept at that final resolution; there is no need to adjust it per
+	// curve.
+	//
+	// Non-positive or non-finite values are treated as
+	// DefaultFlattenTolerance.
+	FlattenTolerance float32
+
+	// MaxFlattenPoints bounds the number of line segments (and hence LineTo
+	// points) that a single QuadTo or CubeTo call is flattened into. It
+	// caps the work done for extremely curvy or extremely large (possibly
+	// out-of-bounds) geometry, which would otherwise be flattened into an
+	// unbounded number of segments; such curves are approximated more
+	// coarsely instead.
+	//
+	// Values less than 2 are treated as DefaultMaxFlattenPoints.
+	MaxFlattenPoints int
+
 	// TODO: an exported field equivalent to the mask point in the
 	// draw.DrawMask function in the stdlib image/draw package?
 }
 
 // Reset resets a Rasterizer as if it was just returned by NewRasterizer.
 //
-// This includes setting z.DrawOp to draw.Over.
+// This includes setting z.DrawOp to draw.Over and z.FlattenTolerance and
+// z.MaxFlattenPoints to their zero (default) values. No path or curve state
+// is carried over from before the Reset.
 func (z *Rasterizer) Reset(w, h int) {
 	z.size = image.Point{w, h}
 	z.firstX = 0
@@ -119,6 +165,8 @@ func (z *Rasterizer) Reset(w, h int) {
 	z.penX = 0
 	z.penY = 0
 	z.DrawOp = draw.Over
+	z.FlattenTolerance = 0
+	z.MaxFlattenPoints = 0
 
 	z.setUseFloatingPointMath(w > floatingPointMathThreshold || h > floatingPointMathThreshold)
 }
@@ -196,12 +244,14 @@ func (z *Rasterizer) LineTo(bx, by float32) {
 // cy), and moves the pen to (cx, cy).
 //
 // The coordinates are allowed to be out of the Rasterizer's bounds.
+//
+// The curve is flattened into at most z.MaxFlattenPoints line segments, with
+// z.FlattenTolerance controlling the approximation error; see the
+// documentation of those fields.
 func (z *Rasterizer) QuadTo(bx, by, cx, cy float32) {
 	ax, ay := z.penX, z.penY
 	devsq := devSquared(ax, ay, bx, by, cx, cy)
-	if devsq >= 0.333 {
-		const tol = 3
-		n := 1 + int(math.Sqrt(math.Sqrt(tol*float64(devsq))))
+	if n := z.flattenSegments(devsq); n > 1 {
 		t, nInv := float32(0), 1/float32(n)
 		for i := 0; i < n-1; i++ {
 			t += nInv
@@ -217,15 +267,17 @@ func (z *Rasterizer) QuadTo(bx, by, cx, cy float32) {
 // to (dx, dy), and moves the pen to (dx, dy).
 //
 // The coordinates are allowed to be out of the Rasterizer's bounds.
+//
+// The curve is flattened into at most z.MaxFlattenPoints line segments, with
+// z.FlattenTolerance controlling the approximation error; see the
+// documentation of those fields.
 func (z *Rasterizer) CubeTo(bx, by, cx, cy, dx, dy float32) {
 	ax, ay := z.penX, z.penY
 	devsq := devSquared(ax, ay, bx, by, dx, dy)
 	if devsqAlt := devSquared(ax, ay, cx, cy, dx, dy); devsq < devsqAlt {
 		devsq = devsqAlt
 	}
-	if devsq >= 0.333 {
-		const tol = 3
-		n := 1 + int(math.Sqrt(math.Sqrt(tol*float64(devsq))))
+	if n := z.flattenSegments(devsq); n > 1 {
 		t, nInv := float32(0), 1/float32(n)
 		for i := 0; i < n-1; i++ {
 			t += nInv
@@ -238,6 +290,66 @@ func (z *Rasterizer) CubeTo(bx, by, cx, cy, dx, dy float32) {
 		}
 	}
 	z.LineTo(dx, dy)
+}
+
+// flattenSegments returns the number of line segments that a Bézier curve
+// with the given devSquared measure is flattened into, honoring
+// z.FlattenTolerance and z.MaxFlattenPoints.
+//
+// The result is deterministic and always in [1, maxN]: devsq may be NaN or
+// +Inf for degenerate or huge coordinates, and the segment count estimate
+// derived from a finite devsq may exceed the int range, but neither may
+// cause unbounded work. There is no recursion here or in the callers, so
+// flattening cannot overflow the goroutine stack.
+func (z *Rasterizer) flattenSegments(devsq float32) int {
+	if !(devsq <= math.MaxFloat32) {
+		// devsq is NaN or +Inf, which means that some coordinate is
+		// non-finite or so large (around 1e19 or more) that the curve is
+		// hopelessly far off-screen. A single segment is deterministic,
+		// bounded and visually identical.
+		return 1
+	}
+	maxN := z.MaxFlattenPoints
+	if maxN < 2 {
+		maxN = DefaultMaxFlattenPoints
+	}
+	coeff, thresh := flattenCoefficients(z.FlattenTolerance)
+	if !(float64(devsq) >= thresh) {
+		return 1
+	}
+	// devsq is finite and positive here, but coeff*devsq can still be +Inf
+	// for a tiny positive tolerance, so n can be +Inf. The comparison
+	// below is false in that case, as it is for any n >= maxN-1.
+	n := math.Sqrt(math.Sqrt(coeff * float64(devsq)))
+	if !(n < float64(maxN-1)) {
+		return maxN
+	}
+	return 1 + int(n)
+}
+
+// flattenCoefficients maps a flatten tolerance τ, in pixels, to the
+// coefficient and devSquared threshold used to compute the segment count.
+//
+// For a quadratic Bézier, devSquared returns |D|² where D is the second
+// difference of the control points, and the curve deviates from its chord by
+// at most |D|/4. Splitting the curve into n equal-parameter segments scales
+// D by 1/n², so the deviation bound becomes |D|/(4n²). Requiring this to be
+// at most τ gives
+//
+//	n ≥ (|D|²/(16τ²))^(1/4),   subdividing only while |D|² ≥ 16τ².
+//
+// A tolerance of 1/(4·√3) ≈ 0.144 therefore recovers the historical
+// constants coeff = 3 and thresh = 1/3. The default case below keeps those
+// exact constants so that a zero FlattenTolerance is bit-for-bit compatible
+// with previous versions of this package.
+//
+// Non-positive or non-finite tolerances (including NaN and ±Inf) map to the
+// default, so every input yields a deterministic, finite segment count.
+func flattenCoefficients(tolerance float32) (coeff, thresh float64) {
+	if t := float64(tolerance); t > 0 && t <= math.MaxFloat32 {
+		return 1 / (16 * t * t), 16 * t * t
+	}
+	return 3, 0.333
 }
 
 // devSquared returns a measure of how curvy the sequence (ax, ay) to (bx, by)
