@@ -81,28 +81,7 @@ func filter246(pix []byte, n, level, ilevel, hlevel, index, iStep, jStep int, fo
 func (d *Decoder) simpleFilter() {
 	for mby := 0; mby < d.mbh; mby++ {
 		for mbx := 0; mbx < d.mbw; mbx++ {
-			f := d.perMBFilterParams[d.mbw*mby+mbx]
-			if f.level == 0 {
-				continue
-			}
-			l := int(f.level)
-			yIndex := (mby*d.img.YStride + mbx) * 16
-			if mbx > 0 {
-				filter2(d.img.Y, l+4, yIndex, d.img.YStride, 1)
-			}
-			if f.inner {
-				filter2(d.img.Y, l, yIndex+0x4, d.img.YStride, 1)
-				filter2(d.img.Y, l, yIndex+0x8, d.img.YStride, 1)
-				filter2(d.img.Y, l, yIndex+0xc, d.img.YStride, 1)
-			}
-			if mby > 0 {
-				filter2(d.img.Y, l+4, yIndex, 1, d.img.YStride)
-			}
-			if f.inner {
-				filter2(d.img.Y, l, yIndex+d.img.YStride*0x4, 1, d.img.YStride)
-				filter2(d.img.Y, l, yIndex+d.img.YStride*0x8, 1, d.img.YStride)
-				filter2(d.img.Y, l, yIndex+d.img.YStride*0xc, 1, d.img.YStride)
-			}
+			d.simpleFilterMacroblock(mbx, mby)
 		}
 	}
 }
@@ -111,38 +90,81 @@ func (d *Decoder) simpleFilter() {
 func (d *Decoder) normalFilter() {
 	for mby := 0; mby < d.mbh; mby++ {
 		for mbx := 0; mbx < d.mbw; mbx++ {
-			f := d.perMBFilterParams[d.mbw*mby+mbx]
-			if f.level == 0 {
-				continue
-			}
-			l, il, hl := int(f.level), int(f.ilevel), int(f.hlevel)
-			yIndex := (mby*d.img.YStride + mbx) * 16
-			cIndex := (mby*d.img.CStride + mbx) * 8
-			if mbx > 0 {
-				filter246(d.img.Y, 16, l+4, il, hl, yIndex, d.img.YStride, 1, false)
-				filter246(d.img.Cb, 8, l+4, il, hl, cIndex, d.img.CStride, 1, false)
-				filter246(d.img.Cr, 8, l+4, il, hl, cIndex, d.img.CStride, 1, false)
-			}
-			if f.inner {
-				filter246(d.img.Y, 16, l, il, hl, yIndex+0x4, d.img.YStride, 1, true)
-				filter246(d.img.Y, 16, l, il, hl, yIndex+0x8, d.img.YStride, 1, true)
-				filter246(d.img.Y, 16, l, il, hl, yIndex+0xc, d.img.YStride, 1, true)
-				filter246(d.img.Cb, 8, l, il, hl, cIndex+0x4, d.img.CStride, 1, true)
-				filter246(d.img.Cr, 8, l, il, hl, cIndex+0x4, d.img.CStride, 1, true)
-			}
-			if mby > 0 {
-				filter246(d.img.Y, 16, l+4, il, hl, yIndex, 1, d.img.YStride, false)
-				filter246(d.img.Cb, 8, l+4, il, hl, cIndex, 1, d.img.CStride, false)
-				filter246(d.img.Cr, 8, l+4, il, hl, cIndex, 1, d.img.CStride, false)
-			}
-			if f.inner {
-				filter246(d.img.Y, 16, l, il, hl, yIndex+d.img.YStride*0x4, 1, d.img.YStride, true)
-				filter246(d.img.Y, 16, l, il, hl, yIndex+d.img.YStride*0x8, 1, d.img.YStride, true)
-				filter246(d.img.Y, 16, l, il, hl, yIndex+d.img.YStride*0xc, 1, d.img.YStride, true)
-				filter246(d.img.Cb, 8, l, il, hl, cIndex+d.img.CStride*0x4, 1, d.img.CStride, true)
-				filter246(d.img.Cr, 8, l, il, hl, cIndex+d.img.CStride*0x4, 1, d.img.CStride, true)
-			}
+			d.normalFilterMacroblock(mbx, mby)
 		}
+	}
+}
+
+// simpleFilterMacroblock applies the simple filter to one macroblock in the
+// same per-macroblock, vertical-before-horizontal order used by
+// simpleFilter. Splitting the loop filter at this granularity is what lets
+// incremental decoding reproduce the whole-frame result pixel-for-pixel: the
+// vertical edges of neighboring macroblocks in a row overlap at corner
+// pixels, so they must not be reordered into separate passes.
+func (d *Decoder) simpleFilterMacroblock(mbx, mby int) {
+	if mby < 0 {
+		return
+	}
+	f := d.perMBFilterParams[d.mbw*mby+mbx]
+	if f.level == 0 {
+		return
+	}
+	l := int(f.level)
+	yIndex := (mby*d.img.YStride + mbx) * 16
+	if mbx > 0 {
+		filter2(d.img.Y, l+4, yIndex, d.img.YStride, 1)
+	}
+	if f.inner {
+		filter2(d.img.Y, l, yIndex+0x4, d.img.YStride, 1)
+		filter2(d.img.Y, l, yIndex+0x8, d.img.YStride, 1)
+		filter2(d.img.Y, l, yIndex+0xc, d.img.YStride, 1)
+	}
+	if mby > 0 {
+		filter2(d.img.Y, l+4, yIndex, 1, d.img.YStride)
+	}
+	if f.inner {
+		filter2(d.img.Y, l, yIndex+d.img.YStride*0x4, 1, d.img.YStride)
+		filter2(d.img.Y, l, yIndex+d.img.YStride*0x8, 1, d.img.YStride)
+		filter2(d.img.Y, l, yIndex+d.img.YStride*0xc, 1, d.img.YStride)
+	}
+}
+
+// normalFilterMacroblock applies the normal filter to one macroblock in the
+// same per-macroblock, vertical-before-horizontal order used by normalFilter.
+func (d *Decoder) normalFilterMacroblock(mbx, mby int) {
+	if mby < 0 {
+		return
+	}
+	f := d.perMBFilterParams[d.mbw*mby+mbx]
+	if f.level == 0 {
+		return
+	}
+	l, il, hl := int(f.level), int(f.ilevel), int(f.hlevel)
+	yIndex := (mby*d.img.YStride + mbx) * 16
+	cIndex := (mby*d.img.CStride + mbx) * 8
+	if mbx > 0 {
+		filter246(d.img.Y, 16, l+4, il, hl, yIndex, d.img.YStride, 1, false)
+		filter246(d.img.Cb, 8, l+4, il, hl, cIndex, d.img.CStride, 1, false)
+		filter246(d.img.Cr, 8, l+4, il, hl, cIndex, d.img.CStride, 1, false)
+	}
+	if f.inner {
+		filter246(d.img.Y, 16, l, il, hl, yIndex+0x4, d.img.YStride, 1, true)
+		filter246(d.img.Y, 16, l, il, hl, yIndex+0x8, d.img.YStride, 1, true)
+		filter246(d.img.Y, 16, l, il, hl, yIndex+0xc, d.img.YStride, 1, true)
+		filter246(d.img.Cb, 8, l, il, hl, cIndex+0x4, d.img.CStride, 1, true)
+		filter246(d.img.Cr, 8, l, il, hl, cIndex+0x4, d.img.CStride, 1, true)
+	}
+	if mby > 0 {
+		filter246(d.img.Y, 16, l+4, il, hl, yIndex, 1, d.img.YStride, false)
+		filter246(d.img.Cb, 8, l+4, il, hl, cIndex, 1, d.img.CStride, false)
+		filter246(d.img.Cr, 8, l+4, il, hl, cIndex, 1, d.img.CStride, false)
+	}
+	if f.inner {
+		filter246(d.img.Y, 16, l, il, hl, yIndex+d.img.YStride*0x4, 1, d.img.YStride, true)
+		filter246(d.img.Y, 16, l, il, hl, yIndex+d.img.YStride*0x8, 1, d.img.YStride, true)
+		filter246(d.img.Y, 16, l, il, hl, yIndex+d.img.YStride*0xc, 1, d.img.YStride, true)
+		filter246(d.img.Cb, 8, l, il, hl, cIndex+d.img.CStride*0x4, 1, d.img.CStride, true)
+		filter246(d.img.Cr, 8, l, il, hl, cIndex+d.img.CStride*0x4, 1, d.img.CStride, true)
 	}
 }
 

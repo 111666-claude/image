@@ -144,6 +144,11 @@ type Decoder struct {
 	// Their specific sizes are documented in reconstruct.go.
 	coeff [1*16*16 + 2*8*8 + 1*4*4]int16
 	ybr   [1 + 16 + 1 + 8][32]uint8
+
+	// busy reports whether a frame decode is in progress. It guards against
+	// re-entering DecodeFrame or DecodeFrameIncremental while an incremental
+	// decode is suspended inside a progress callback.
+	busy bool
 }
 
 // NewDecoder returns a new Decoder.
@@ -362,6 +367,11 @@ func (d *Decoder) parseOtherHeaders() error {
 // DecodeFrame decodes the frame and returns it as an YCbCr image.
 // The image's contents are valid up until the next call to Decoder.Init.
 func (d *Decoder) DecodeFrame() (*image.YCbCr, error) {
+	if d.busy {
+		return nil, errIncrementalInProgress
+	}
+	d.busy = true
+	defer func() { d.busy = false }()
 	d.ensureImg()
 	if err := d.parseOtherHeaders(); err != nil {
 		return nil, err
