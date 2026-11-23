@@ -5,6 +5,9 @@
 package sfnt
 
 import (
+	"fmt"
+	"unicode"
+
 	"golang.org/x/text/encoding/charmap"
 )
 
@@ -83,6 +86,8 @@ var supportedCmapFormat = func(format, pid, psid uint16) bool {
 	case 6:
 		return true
 	case 12:
+		return true
+	case 13:
 		return true
 	}
 	return false
@@ -297,6 +302,111 @@ func (f *Font) makeCachedGlyphIndexFormat12(buf []byte, offset, _ uint32) ([]byt
 				i = h + 1
 			} else {
 				return GlyphIndex(c - entry.start + entry.delta), nil
+			}
+		}
+		return 0, nil
+	}, nil
+}
+
+// makeCachedGlyphIndexFormat13 parses a "Many-to-one range mappings" subtable.
+//
+// A format 13 subtable has the same 16-byte header and 12-byte group record
+// wire layout as a format 12 subtable, but every group maps the entire
+// [start, end] code point range to the single glyph index delta, instead of
+// mapping start+i to delta+i.
+//
+// Unlike the other cmap formats, the groups are validated eagerly (while the
+// font is being parsed), so that malformed groups are reported with the
+// offending group's index as context instead of being silently mis-decoded at
+// GlyphIndex time.
+func (f *Font) makeCachedGlyphIndexFormat13(buf []byte, offset, _ uint32, numGlyphs int32) ([]byte, glyphIndexFunc, error) {
+	const headerSize = 16
+	if offset+headerSize > f.cmap.length {
+		return nil, nil, errInvalidCmapTable
+	}
+	var err error
+	buf, err = f.src.view(buf, int(f.cmap.offset+offset), headerSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	if format := u16(buf); format != 13 {
+		return nil, nil, errInvalidCmapTable
+	}
+	length := u32(buf[4:])
+	if f.cmap.length < offset || length > f.cmap.length-offset {
+		return nil, nil, errInvalidCmapTable
+	}
+	offset += headerSize
+
+	numGroups := u32(buf[12:])
+	if numGroups > maxCmapSegments {
+		return nil, nil, fmt.Errorf("%w: format 13 numGroups=%d exceeds limit %d",
+			errUnsupportedNumberOfCmapSegments, numGroups, maxCmapSegments)
+	}
+
+	eLength := 12 * numGroups
+	if headerSize+eLength != length {
+		return nil, nil, fmt.Errorf("%w: format 13 length=%d inconsistent with numGroups=%d",
+			errInvalidCmapTable, length, numGroups)
+	}
+	if numGroups != 0 {
+		buf, err = f.src.view(buf, int(f.cmap.offset+offset), int(eLength))
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	offset += eLength
+
+	entries := make([]cmapEntry32, numGroups)
+	for i := range entries {
+		entries[i] = cmapEntry32{
+			start: u32(buf[0+12*i:]),
+			end:   u32(buf[4+12*i:]),
+			delta: u32(buf[8+12*i:]),
+		}
+	}
+
+	// Validate the groups eagerly. All errors carry the offending group's
+	// index as context, since a format 13 subtable can contain many groups.
+	prevEnd := uint32(0)
+	for i, entry := range entries {
+		if entry.start > entry.end {
+			return nil, nil, fmt.Errorf("%w: format 13 group %d has start %#x > end %#x",
+				errInvalidCmapTable, i, entry.start, entry.end)
+		}
+		if entry.start > unicode.MaxRune {
+			return nil, nil, fmt.Errorf("%w: format 13 group %d starts at code point %#x, beyond Unicode max %#x",
+				errInvalidCmapTable, i, entry.start, unicode.MaxRune)
+		}
+		if entry.end > unicode.MaxRune {
+			return nil, nil, fmt.Errorf("%w: format 13 group %d ends at code point %#x, beyond Unicode max %#x",
+				errInvalidCmapTable, i, entry.end, unicode.MaxRune)
+		}
+		if i > 0 && entry.start <= prevEnd {
+			return nil, nil, fmt.Errorf("%w: format 13 group %d (%#x-%#x) overlaps previous group ending at %#x",
+				errInvalidCmapTable, i, entry.start, entry.end, prevEnd)
+		}
+		if int64(entry.delta) >= int64(numGlyphs) {
+			return nil, nil, fmt.Errorf("%w: format 13 group %d maps to glyph index %d, but font only has %d glyphs",
+				errInvalidCmapTable, i, entry.delta, numGlyphs)
+		}
+		prevEnd = entry.end
+	}
+
+	// entries is captured by value (well, by slice header) and never mutated
+	// after this point, so the returned closure is safe to call concurrently.
+	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
+		c := uint32(r)
+		for i, j := 0, len(entries); i < j; {
+			h := i + (j-i)/2
+			entry := &entries[h]
+			if c < entry.start {
+				j = h
+			} else if entry.end < c {
+				i = h + 1
+			} else {
+				// Many-to-one: every code point in the range maps to delta.
+				return GlyphIndex(entry.delta), nil
 			}
 		}
 		return 0, nil

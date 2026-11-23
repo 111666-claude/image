@@ -714,7 +714,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
-	buf, glyphIndex, err := f.parseCmap(buf)
+	buf, glyphIndex, err := f.parseCmap(buf, numGlyphs)
 	if err != nil {
 		return err
 	}
@@ -884,7 +884,7 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, finalTab
 	return buf, finalTableOffset, isPostScript, nil
 }
 
-func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, err error) {
+func (f *Font) parseCmap(buf []byte, numGlyphs int32) (buf1 []byte, glyphIndex glyphIndexFunc, err error) {
 	// https://www.microsoft.com/typography/OTSPEC/cmap.htm
 
 	const headerSize, entrySize = 4, 8
@@ -943,6 +943,12 @@ func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, er
 
 	if bestWidth == 0 {
 		return nil, nil, errUnsupportedCmapEncodings
+	}
+	// Format 13 needs the maxp table's numGlyphs to validate that every group
+	// maps to a real glyph. The other formats' makers don't take it, so only
+	// the format 13 call site is diverted here.
+	if bestFormat == 13 {
+		return f.makeCachedGlyphIndexFormat13(buf, bestOffset, bestLength, numGlyphs)
 	}
 	return f.makeCachedGlyphIndex(buf, bestOffset, bestLength, bestFormat)
 }
