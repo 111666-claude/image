@@ -20,13 +20,18 @@ var errInvalidFormat = errors.New("webp: invalid format")
 
 var (
 	fccALPH = riff.FourCC{'A', 'L', 'P', 'H'}
+	fccANIM = riff.FourCC{'A', 'N', 'I', 'M'}
+	fccANMF = riff.FourCC{'A', 'N', 'M', 'F'}
 	fccVP8  = riff.FourCC{'V', 'P', '8', ' '}
 	fccVP8L = riff.FourCC{'V', 'P', '8', 'L'}
 	fccVP8X = riff.FourCC{'V', 'P', '8', 'X'}
 	fccWEBP = riff.FourCC{'W', 'E', 'B', 'P'}
 )
 
-func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
+// decode reads an image or its configuration. For animations, a non-nil
+// animation receives every frame instead of returning the first displayed
+// frame.
+func decode(r io.Reader, configOnly bool, animation *Animation) (image.Image, image.Config, error) {
 	formType, riffReader, err := riff.NewReader(r)
 	if err != nil {
 		return nil, image.Config{}, err
@@ -89,6 +94,11 @@ func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 					Height:     fh.Height,
 				}, nil
 			}
+			// A VP8X chunk already declared the canvas size; the VP8
+			// bitstream dimensions must agree.
+			if seenVP8X && (fh.Width != int(widthMinusOne)+1 || fh.Height != int(heightMinusOne)+1) {
+				return nil, image.Config{}, errInvalidFormat
+			}
 			m, err := d.DecodeFrame()
 			if err != nil {
 				return nil, image.Config{}, err
@@ -109,6 +119,24 @@ func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 			if configOnly {
 				c, err := vp8l.DecodeConfig(chunkData)
 				return nil, c, err
+			}
+			// When a VP8X chunk advertised the canvas dimensions, the VP8L
+			// bitstream's own dimensions must match. Peek the 5-byte VP8L
+			// header before decoding, so a mismatched, oversized bitstream
+			// cannot allocate pixels beyond the declared canvas.
+			if seenVP8X {
+				if _, err := io.ReadFull(chunkData, buf[:5]); err != nil {
+					return nil, image.Config{}, err
+				}
+				c, err := vp8l.DecodeConfig(bytes.NewReader(buf[:5]))
+				if err != nil {
+					return nil, image.Config{}, err
+				}
+				if c.Width != int(widthMinusOne)+1 || c.Height != int(heightMinusOne)+1 {
+					return nil, image.Config{}, errInvalidFormat
+				}
+				m, err := vp8l.Decode(io.MultiReader(bytes.NewReader(buf[:5]), chunkData))
+				return m, image.Config{}, err
 			}
 			m, err := vp8l.Decode(chunkData)
 			return m, image.Config{}, err
@@ -135,6 +163,15 @@ func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 			widthMinusOne = uint32(buf[4]) | uint32(buf[5])<<8 | uint32(buf[6])<<16
 			heightMinusOne = uint32(buf[7]) | uint32(buf[8])<<8 | uint32(buf[9])<<16
 			if configOnly {
+				if buf[0]&animationBit != 0 {
+					// Decode composites animation frames onto an NRGBA canvas.
+					// Its background can be transparent even without alphaBit.
+					return nil, image.Config{
+						ColorModel: color.NRGBAModel,
+						Width:      int(widthMinusOne) + 1,
+						Height:     int(heightMinusOne) + 1,
+					}, nil
+				}
 				if wantAlpha {
 					return nil, image.Config{
 						ColorModel: color.NYCbCrAModel,
@@ -148,6 +185,23 @@ func decode(r io.Reader, configOnly bool) (image.Image, image.Config, error) {
 					Height:     int(heightMinusOne) + 1,
 				}, nil
 			}
+			if buf[0]&animationBit != 0 {
+				a, err := decodeAnimation(riffReader, int(widthMinusOne)+1, int(heightMinusOne)+1, animation != nil)
+				if err != nil {
+					return nil, image.Config{}, err
+				}
+				if animation != nil {
+					*animation = *a
+					return nil, image.Config{}, nil
+				}
+				m, err := firstFrame(a)
+				return m, image.Config{}, err
+			}
+		default:
+			// Skip chunks that are not meaningful to a static decoder, such as
+			// ANIM in a file whose VP8X animation flag is unset, or metadata
+			// chunks (ICCP, EXIF, XMP). The RIFF reader drains the payload and
+			// any padding byte on the next Next call.
 		}
 	}
 }
@@ -256,8 +310,12 @@ func unfilterAlpha(alpha []byte, alphaStride int, filter byte) {
 }
 
 // Decode reads a WEBP image from r and returns it as an image.Image.
+//
+// For an animated image, it returns the first frame composited onto the
+// animation's background, with the dimensions of the animation's canvas. It
+// does not decode subsequent frames. Use DecodeAll to read every frame.
 func Decode(r io.Reader) (image.Image, error) {
-	m, _, err := decode(r, false)
+	m, _, err := decode(r, false, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +325,7 @@ func Decode(r io.Reader) (image.Image, error) {
 // DecodeConfig returns the color model and dimensions of a WEBP image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	_, c, err := decode(r, true)
+	_, c, err := decode(r, true, nil)
 	return c, err
 }
 
