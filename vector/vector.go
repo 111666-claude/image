@@ -92,6 +92,16 @@ type Rasterizer struct {
 	bufF32 []float32
 	bufU32 []uint32
 
+	// mask holds the cumulative (accumulated) 16-bit coverage values. It is
+	// separate from bufF32/bufU32, which hold the per-scanline, per-cell
+	// individual area values. Accumulating into a separate buffer means that
+	// producing a coverage mask (see Rasterizer.Coverage) does not destroy
+	// the individual area values: a Coverage call can be followed by more
+	// Draw calls, or by another Coverage call, without re-feeding the paths.
+	// This buffer is scratch space and is never exposed to the package's
+	// clients.
+	mask []uint32
+
 	useFloatingPointMath bool
 
 	size   image.Point
@@ -299,23 +309,33 @@ func (z *Rasterizer) Draw(dst draw.Image, r image.Rectangle, src image.Image, sp
 	}
 }
 
+// accumulateMask converts the per-cell individual area values (in z.bufF32 or
+// z.bufU32) into cumulative, non-zero-winding 16-bit coverage values in z.mask.
+//
+// The individual area values are left untouched, so calling accumulateMask
+// more than once (for example, once for Coverage and again for Draw) produces
+// the same mask each time without re-feeding the paths.
 func (z *Rasterizer) accumulateMask() {
+	n := z.size.X * z.size.Y
+	if n > cap(z.mask) {
+		z.mask = make([]uint32, n)
+	} else {
+		z.mask = z.mask[:n]
+	}
 	if z.useFloatingPointMath {
-		if n := z.size.X * z.size.Y; n > cap(z.bufU32) {
-			z.bufU32 = make([]uint32, n)
-		} else {
-			z.bufU32 = z.bufU32[:n]
-		}
 		if haveAccumulateSIMD {
-			floatingAccumulateMaskSIMD(z.bufU32, z.bufF32)
+			floatingAccumulateMaskSIMD(z.mask, z.bufF32)
 		} else {
-			floatingAccumulateMask(z.bufU32, z.bufF32)
+			floatingAccumulateMask(z.mask, z.bufF32)
 		}
 	} else {
+		// The fixed point implementation accumulates in place, so first copy
+		// the individual area values into the scratch mask buffer.
+		copy(z.mask, z.bufU32[:n])
 		if haveAccumulateSIMD {
-			fixedAccumulateMaskSIMD(z.bufU32)
+			fixedAccumulateMaskSIMD(z.mask)
 		} else {
-			fixedAccumulateMask(z.bufU32)
+			fixedAccumulateMask(z.mask)
 		}
 	}
 }
@@ -345,7 +365,7 @@ func (z *Rasterizer) rasterizeDstAlphaSrcOpaqueOpOver(dst *image.Alpha, r image.
 	pix := dst.Pix[dst.PixOffset(r.Min.X, r.Min.Y):]
 	for y, y1 := 0, r.Max.Y-r.Min.Y; y < y1; y++ {
 		for x, x1 := 0, r.Max.X-r.Min.X; x < x1; x++ {
-			ma := z.bufU32[y*z.size.X+x]
+			ma := z.mask[y*z.size.X+x]
 			i := y*dst.Stride + x
 
 			// This formula is like rasterizeOpOver's, simplified for the
@@ -381,7 +401,7 @@ func (z *Rasterizer) rasterizeDstAlphaSrcOpaqueOpSrc(dst *image.Alpha, r image.R
 	pix := dst.Pix[dst.PixOffset(r.Min.X, r.Min.Y):]
 	for y, y1 := 0, r.Max.Y-r.Min.Y; y < y1; y++ {
 		for x, x1 := 0, r.Max.X-r.Min.X; x < x1; x++ {
-			ma := z.bufU32[y*z.size.X+x]
+			ma := z.mask[y*z.size.X+x]
 
 			// This formula is like rasterizeOpSrc's, simplified for the
 			// concrete dst type and opaque src assumption.
@@ -395,7 +415,7 @@ func (z *Rasterizer) rasterizeDstRGBASrcUniformOpOver(dst *image.RGBA, r image.R
 	pix := dst.Pix[dst.PixOffset(r.Min.X, r.Min.Y):]
 	for y, y1 := 0, r.Max.Y-r.Min.Y; y < y1; y++ {
 		for x, x1 := 0, r.Max.X-r.Min.X; x < x1; x++ {
-			ma := z.bufU32[y*z.size.X+x]
+			ma := z.mask[y*z.size.X+x]
 
 			// This formula is like rasterizeOpOver's, simplified for the
 			// concrete dst type and uniform src assumption.
@@ -414,7 +434,7 @@ func (z *Rasterizer) rasterizeDstRGBASrcUniformOpSrc(dst *image.RGBA, r image.Re
 	pix := dst.Pix[dst.PixOffset(r.Min.X, r.Min.Y):]
 	for y, y1 := 0, r.Max.Y-r.Min.Y; y < y1; y++ {
 		for x, x1 := 0, r.Max.X-r.Min.X; x < x1; x++ {
-			ma := z.bufU32[y*z.size.X+x]
+			ma := z.mask[y*z.size.X+x]
 
 			// This formula is like rasterizeOpSrc's, simplified for the
 			// concrete dst type and uniform src assumption.
@@ -434,7 +454,7 @@ func (z *Rasterizer) rasterizeOpOver(dst draw.Image, r image.Rectangle, src imag
 	for y, y1 := 0, r.Max.Y-r.Min.Y; y < y1; y++ {
 		for x, x1 := 0, r.Max.X-r.Min.X; x < x1; x++ {
 			sr, sg, sb, sa := src.At(sp.X+x, sp.Y+y).RGBA()
-			ma := z.bufU32[y*z.size.X+x]
+			ma := z.mask[y*z.size.X+x]
 
 			// This algorithm comes from the standard library's image/draw
 			// package.
@@ -457,7 +477,7 @@ func (z *Rasterizer) rasterizeOpSrc(dst draw.Image, r image.Rectangle, src image
 	for y, y1 := 0, r.Max.Y-r.Min.Y; y < y1; y++ {
 		for x, x1 := 0, r.Max.X-r.Min.X; x < x1; x++ {
 			sr, sg, sb, sa := src.At(sp.X+x, sp.Y+y).RGBA()
-			ma := z.bufU32[y*z.size.X+x]
+			ma := z.mask[y*z.size.X+x]
 
 			// This algorithm comes from the standard library's image/draw
 			// package.
