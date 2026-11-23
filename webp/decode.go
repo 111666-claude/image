@@ -6,6 +6,7 @@ package webp
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -262,6 +263,44 @@ func Decode(r io.Reader) (image.Image, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+// DecodeRegion decodes only the requested sub-rectangle of a lossless
+// (VP8L) WEBP image from r. It is a thin RIFF-container wrapper around
+// vp8l.DecodeRegion: see that function for the rectangle, cancellation,
+// memory-limit and pixel-semantics details.
+//
+// Lossy (VP8) and animated WEBP images are not supported and return an
+// error. The rectangle is given in full-image coordinates and is clipped to
+// the image bounds; an empty clipped rectangle yields an empty image.
+func DecodeRegion(ctx context.Context, r io.Reader, rect image.Rectangle, opts *vp8l.Options) (*image.NRGBA, error) {
+	formType, riffReader, err := riff.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	if formType != fccWEBP {
+		return nil, errInvalidFormat
+	}
+	for {
+		chunkID, _, chunkData, err := riffReader.Next()
+		if err == io.EOF {
+			err = errInvalidFormat
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch chunkID {
+		case fccVP8L:
+			return vp8l.DecodeRegion(ctx, chunkData, rect, opts)
+		case fccVP8:
+			return nil, errors.New("webp: region decode is not supported for lossy VP8 images")
+		case fccALPH, fccVP8X:
+			// Skip container/alpha chunks; only the simple lossless path is
+			// supported and a VP8L chunk carries its own alpha.
+		default:
+			// Skip unknown chunks.
+		}
+	}
 }
 
 // DecodeConfig returns the color model and dimensions of a WEBP image without

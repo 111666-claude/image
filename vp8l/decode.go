@@ -10,16 +10,50 @@ package vp8l // import "golang.org/x/image/vp8l"
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"image"
 	"image/color"
 	"io"
+	"unsafe"
 )
 
 var (
 	errInvalidCodeLengths = errors.New("vp8l: invalid code lengths")
 	errInvalidHuffmanTree = errors.New("vp8l: invalid Huffman tree")
 )
+
+// ErrMemoryLimitExceeded is returned when a decode would allocate more than
+// the caller-supplied memory limit.
+var ErrMemoryLimitExceeded = errors.New("vp8l: memory limit exceeded")
+
+// memAccount tracks the cumulative amount of memory charged against a limit.
+// It is not safe for concurrent use, but a single decode is single-goroutine.
+type memAccount struct {
+	used  int64
+	limit int64
+}
+
+// charge records n additional bytes, returning ErrMemoryLimitExceeded if the
+// cumulative total would exceed the limit. A non-positive n is a no-op.
+func (a *memAccount) charge(n int64) error {
+	if a == nil || n <= 0 {
+		return nil
+	}
+	if a.limit-a.used < n {
+		return ErrMemoryLimitExceeded
+	}
+	a.used += n
+	return nil
+}
+
+// maxLZ77DistancePixels bounds the size of the region decoder's ring buffer.
+// A VP8L backwards distance is either one of the 120 two-dimensional offsets
+// in distanceMapTable (at most 127 pixels) or a literal linear offset for
+// distance codes above the table. lz77Param tops out at 24 bits of value, so
+// 1<<20 pixels (4 MiB of RGBA) is a conservative cap that keeps every legal
+// reference addressable while fixing the ring's memory footprint.
+const maxLZ77DistancePixels = 1 << 20
 
 // colorCacheMultiplier is the multiplier used for the color cache hash
 // function, specified in section 4.2.3.
@@ -61,6 +95,14 @@ type decoder struct {
 	r     io.ByteReader
 	bits  uint32
 	nBits uint32
+
+	// acc, if non-nil, charges every decoder-internal allocation against a
+	// caller-supplied memory limit. When nil, allocations are unbounded,
+	// which preserves the behavior of the full-image Decode path.
+	acc *memAccount
+	// ctx, if non-nil, is checked for cancellation between scanlines during
+	// region decodes.
+	ctx context.Context
 }
 
 // read reads the next n bits from the decoder's bit-stream.
@@ -252,7 +294,10 @@ func (d *decoder) decodeHuffmanTree(h *hTree, alphabetSize uint32) error {
 				return err
 			}
 		}
-		return h.buildSimple(nSymbols, symbols, alphabetSize)
+		if err := h.buildSimple(nSymbols, symbols, alphabetSize); err != nil {
+			return err
+		}
+		return d.acc.charge(int64(cap(h.nodes)) * int64(unsafe.Sizeof(hNode{})))
 	}
 
 	nCodes, err := d.read(4)
@@ -271,10 +316,16 @@ func (d *decoder) decodeHuffmanTree(h *hTree, alphabetSize uint32) error {
 		}
 	}
 	codeLengths := make([]uint32, alphabetSize)
+	if err := d.acc.charge(int64(alphabetSize) * 4); err != nil {
+		return err
+	}
 	if err = d.decodeCodeLengths(codeLengths, codeLengthCodeLengths[:]); err != nil {
 		return err
 	}
-	return h.build(codeLengths)
+	if err = h.build(codeLengths); err != nil {
+		return err
+	}
+	return d.acc.charge(int64(cap(h.nodes)) * int64(unsafe.Sizeof(hNode{})))
 }
 
 const (
@@ -319,6 +370,9 @@ func (d *decoder) decodeHuffmanGroups(w int32, h int32, topLevel bool, ccBits ui
 				}
 			}
 		}
+	}
+	if err := d.acc.charge(int64(maxHGroupIndex+1) * int64(unsafe.Sizeof(hGroup{}))); err != nil {
+		return nil, nil, 0, err
 	}
 	hGroups = make([]hGroup, maxHGroupIndex+1)
 	for i := range hGroups {
@@ -366,6 +420,9 @@ func (d *decoder) decodePix(w int32, h int32, minCap int32, topLevel bool) ([]by
 		}
 		ccShift = 32 - ccBits
 		ccEntries = make([]uint32, 1<<ccBits)
+		if err := d.acc.charge(int64(len(ccEntries)) * 4); err != nil {
+			return nil, err
+		}
 	}
 
 	// Decode the Huffman groups.
@@ -381,6 +438,9 @@ func (d *decoder) decodePix(w int32, h int32, minCap int32, topLevel bool) ([]by
 	// Decode the pixels.
 	if minCap < 4*w*h {
 		minCap = 4 * w * h
+	}
+	if err := d.acc.charge(int64(minCap)); err != nil {
+		return nil, err
 	}
 	pix := make([]byte, 4*w*h, minCap)
 	p, cachedP := 0, 0
