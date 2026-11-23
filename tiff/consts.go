@@ -61,10 +61,11 @@ const (
 	tYResolution    = 283
 	tResolutionUnit = 296
 
-	tPredictor    = 317
-	tColorMap     = 320
-	tExtraSamples = 338
-	tSampleFormat = 339
+	tPredictor           = 317
+	tPlanarConfiguration = 284
+	tColorMap            = 320
+	tExtraSamples        = 338
+	tSampleFormat        = 339
 )
 
 // Compression types (defined in various places in the spec and supplements).
@@ -91,6 +92,20 @@ const (
 	pCMYK        = 5
 	pYCbCr       = 6
 	pCIELab      = 8
+)
+
+// Values for the tSampleFormat tag (page 27 of the spec).
+const (
+	sfUnsignedInt = 1
+	sfSignedInt   = 2
+	sfFloat       = 3
+)
+
+// Values for the tExtraSamples tag (page 31-32 of the spec).
+const (
+	esUnspecified  = 0
+	esAssociated   = 1
+	esUnassociated = 2
 )
 
 // Values for the tPredictor tag (page 64-65 of the spec).

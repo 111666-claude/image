@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -39,6 +40,7 @@ func (e UnsupportedError) Error() string {
 var (
 	errNoPixels          = FormatError("not enough pixel data")
 	errInvalidColorIndex = FormatError("invalid color index")
+	errNoSuchPage        = errors.New("no such page")
 )
 
 const maxChunkSize = 10 << 20 // 10M
@@ -95,6 +97,17 @@ type decoder struct {
 	bpp       uint
 	features  map[int][]uint
 	palette   []color.Color
+
+	// Floating-point sample decoding (SampleFormat 3).
+	isFloat     bool
+	page        int // Zero-based page index, used for error context.
+	samples     int // Samples per pixel.
+	floatBytes  int // Bytes per floating-point sample.
+	floatOpts   FloatOptions
+	outBits     int    // Output bit depth: 8 or 16.
+	outMax      uint32 // 0xff or 0xffff.
+	grayAlpha   bool   // Gray plus alpha, stored in an NRGBA or RGBA image.
+	whiteIsZero bool   // PhotometricInterpretation is pWhiteIsZero.
 
 	buf   []byte
 	off   int    // Current offset in buf.
@@ -173,6 +186,8 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tStripOffsets,
 		tStripByteCounts,
 		tRowsPerStrip,
+		tSamplesPerPixel,
+		tPlanarConfiguration,
 		tTileWidth,
 		tTileLength,
 		tTileOffsets,
@@ -210,15 +225,21 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		// the value is not 1 [= unsigned integer data], a Baseline
 		// TIFF reader that cannot handle the SampleFormat value
 		// must terminate the import process gracefully.
+		//
+		// This implementation additionally supports IEEE floating
+		// point data (value 3). Validation that the bit depths and
+		// channel counts are consistent with floating point happens
+		// in newDecoder, once all of the IFD has been read.
 		val, err := d.ifdUint(p)
 		if err != nil {
 			return 0, err
 		}
 		for _, v := range val {
-			if v != 1 {
+			if v != sfUnsignedInt && v != sfFloat {
 				return 0, UnsupportedError("sample format")
 			}
 		}
+		d.features[int(tag)] = val
 	}
 	return int(tag), nil
 }
@@ -450,9 +471,16 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 }
 
 func newDecoder(r io.Reader) (*decoder, error) {
+	return newDecoderPage(r, 0, nil)
+}
+
+// newDecoderPage decodes the IFD of the page with the given zero-based index.
+// opt may be nil.
+func newDecoderPage(r io.Reader, page int, opt *DecodeOptions) (*decoder, error) {
 	d := &decoder{
 		r:        newReaderAt(r),
 		features: make(map[int][]uint),
+		page:     page,
 	}
 
 	p := make([]byte, 8)
@@ -472,6 +500,19 @@ func newDecoder(r io.Reader) (*decoder, error) {
 	}
 
 	ifdOffset := int64(d.byteOrder.Uint32(p[4:8]))
+	for i := 0; i < page; i++ {
+		if ifdOffset == 0 {
+			return nil, makePageError(page, -1, errNoSuchPage)
+		}
+		next, err := d.nextIFDOffset(ifdOffset)
+		if err != nil {
+			return nil, makePageError(page, -1, err)
+		}
+		ifdOffset = next
+	}
+	if ifdOffset == 0 {
+		return nil, makePageError(page, -1, errNoSuchPage)
+	}
 
 	// The first two bytes contain the number of entries (12 bytes each).
 	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
@@ -490,6 +531,12 @@ func newDecoder(r io.Reader) (*decoder, error) {
 	for i := 0; i < len(p); i += ifdLen {
 		tag, err := d.parseIFD(p[i : i+ifdLen])
 		if err != nil {
+			// Attach page context to failures on floating-point pages, where
+			// the per-page contract matters, while leaving integer error
+			// values untouched.
+			if d.ifdIsFloat(p) {
+				return nil, makePageError(page, -1, err)
+			}
 			return nil, err
 		}
 		if tag <= prevTag {
@@ -498,6 +545,31 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		prevTag = tag
 	}
 
+	if err := d.setup(opt); err != nil {
+		if d.isFloat {
+			return nil, d.pageError(-1, err)
+		}
+		return nil, err
+	}
+	return d, nil
+}
+
+// nextIFDOffset returns the offset of the IFD following the one at off.
+func (d *decoder) nextIFDOffset(off int64) (int64, error) {
+	var p [2]byte
+	if _, err := d.r.ReadAt(p[:], off); err != nil {
+		return 0, err
+	}
+	n := int64(d.byteOrder.Uint16(p[:]))
+	var q [4]byte
+	if _, err := d.r.ReadAt(q[:], off+2+ifdLen*n); err != nil {
+		return 0, err
+	}
+	return int64(d.byteOrder.Uint32(q[:])), nil
+}
+
+// setup validates the IFD's features and determines the image mode.
+func (d *decoder) setup(opt *DecodeOptions) error {
 	d.config.Width = int(d.firstVal(tImageWidth))
 	d.config.Height = int(d.firstVal(tImageLength))
 
@@ -506,28 +578,172 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		d.features[tBitsPerSample] = []uint{1}
 	}
 	d.bpp = d.firstVal(tBitsPerSample)
+
+	// SampleFormat 3 is IEEE floating point. Every sample must be declared
+	// floating point: mixed integer and float samples in one page are not
+	// supported.
+	if sf := d.features[tSampleFormat]; len(sf) != 0 {
+		for _, v := range sf {
+			if v == sfFloat {
+				d.isFloat = true
+			}
+		}
+		if d.isFloat {
+			for _, v := range sf {
+				if v != sfFloat {
+					return UnsupportedError("mixed sample formats")
+				}
+			}
+		}
+	}
+	if d.isFloat {
+		var f FloatOptions
+		if opt != nil && opt.Float != nil {
+			f = *opt.Float
+		}
+		fo, err := normalizeFloatOptions(&f)
+		if err != nil {
+			return err
+		}
+		d.floatOpts = fo
+		d.outBits = fo.BitDepth
+		if d.outBits == 16 {
+			d.outMax = 0xffff
+		} else {
+			d.outMax = 0xff
+		}
+		switch d.bpp {
+		case 16, 32, 64:
+			d.floatBytes = int(d.bpp) / 8
+		default:
+			return UnsupportedError(fmt.Sprintf("floating point BitsPerSample of %v", d.bpp))
+		}
+		return d.setupFloat()
+	}
+
 	switch d.bpp {
 	case 0:
-		return nil, FormatError("BitsPerSample must not be 0")
+		return FormatError("BitsPerSample must not be 0")
 	case 1, 8, 16:
 		// Nothing to do, these are accepted by this implementation.
 	default:
-		return nil, UnsupportedError(fmt.Sprintf("BitsPerSample of %v", d.bpp))
+		return UnsupportedError(fmt.Sprintf("BitsPerSample of %v", d.bpp))
+	}
+	return d.setupInteger()
+}
+
+// setupFloat determines the image mode for a floating-point page.
+func (d *decoder) setupFloat() error {
+	if p := d.firstVal(tPredictor); p != 0 && p != prNone {
+		// TIFF Technical Note 3 defines a floating-point predictor, but it
+		// differs from the integer horizontal predictor. Decoding it as if it
+		// were the integer predictor would silently produce wrong pixels.
+		return UnsupportedError("predictor with floating point samples")
+	}
+	for _, b := range d.features[tBitsPerSample] {
+		if b != d.bpp {
+			return FormatError("inconsistent BitsPerSample values")
+		}
+	}
+	nsamples := len(d.features[tBitsPerSample])
+	// The data layout assumed below is chunky: one sample of each channel,
+	// interleaved per pixel. PlanarConfiguration 2 (separate planes) would
+	// need a different layout, so reject it rather than mis-decode.
+	if pc := d.firstVal(tPlanarConfiguration); pc != 0 && pc != 1 {
+		return UnsupportedError("planar configuration with floating point samples")
+	}
+	// If SamplesPerPixel is present it must agree with the sample count
+	// implied by BitsPerSample.
+	if spp := d.firstVal(tSamplesPerPixel); spp != 0 && int(spp) != nsamples {
+		return FormatError("inconsistent SamplesPerPixel and BitsPerSample counts")
+	}
+	d.samples = nsamples
+	d.grayAlpha = false
+
+	colorModel := func(out16 bool) color.Model {
+		if out16 {
+			return color.RGBA64Model
+		}
+		return color.RGBAModel
+	}
+	alphaModel := func(out16 bool) color.Model {
+		if out16 {
+			return color.NRGBA64Model
+		}
+		return color.NRGBAModel
 	}
 
+	switch d.firstVal(tPhotometricInterpretation) {
+	case pRGB:
+		switch nsamples {
+		case 3:
+			d.mode = mRGB
+			d.config.ColorModel = colorModel(d.outBits == 16)
+		case 4:
+			switch d.firstVal(tExtraSamples) {
+			case esAssociated:
+				d.mode = mRGBA
+				d.config.ColorModel = colorModel(d.outBits == 16)
+			case esUnassociated:
+				d.mode = mNRGBA
+				d.config.ColorModel = alphaModel(d.outBits == 16)
+			default:
+				return FormatError("wrong number of samples for RGB")
+			}
+		default:
+			return FormatError("wrong number of samples for RGB")
+		}
+	case pBlackIsZero, pWhiteIsZero:
+		if d.firstVal(tPhotometricInterpretation) == pWhiteIsZero {
+			d.mode = mGrayInvert
+			d.whiteIsZero = true
+		} else {
+			d.mode = mGray
+		}
+		if d.outBits == 16 {
+			d.config.ColorModel = color.Gray16Model
+		} else {
+			d.config.ColorModel = color.GrayModel
+		}
+		switch nsamples {
+		case 1:
+			// Plain grayscale.
+		case 2:
+			switch d.firstVal(tExtraSamples) {
+			case esAssociated:
+				d.mode = mRGBA
+				d.config.ColorModel = colorModel(d.outBits == 16)
+			case esUnassociated:
+				d.mode = mNRGBA
+				d.config.ColorModel = alphaModel(d.outBits == 16)
+			default:
+				return FormatError("wrong number of samples for gray")
+			}
+			d.grayAlpha = true
+		default:
+			return UnsupportedError("extra samples")
+		}
+	default:
+		return UnsupportedError("color model")
+	}
+	return nil
+}
+
+// setupInteger determines the image mode for an integer page.
+func (d *decoder) setupInteger() error {
 	// Determine the image mode.
 	switch d.firstVal(tPhotometricInterpretation) {
 	case pRGB:
 		if d.bpp == 16 {
 			for _, b := range d.features[tBitsPerSample] {
 				if b != 16 {
-					return nil, FormatError("wrong number of samples for 16bit RGB")
+					return FormatError("wrong number of samples for 16bit RGB")
 				}
 			}
 		} else {
 			for _, b := range d.features[tBitsPerSample] {
 				if b != 8 {
-					return nil, FormatError("wrong number of samples for 8bit RGB")
+					return FormatError("wrong number of samples for 8bit RGB")
 				}
 			}
 		}
@@ -562,10 +778,10 @@ func newDecoder(r io.Reader) (*decoder, error) {
 					d.config.ColorModel = color.NRGBAModel
 				}
 			default:
-				return nil, FormatError("wrong number of samples for RGB")
+				return FormatError("wrong number of samples for RGB")
 			}
 		default:
-			return nil, FormatError("wrong number of samples for RGB")
+			return FormatError("wrong number of samples for RGB")
 		}
 	case pPaletted:
 		d.mode = mPaletted
@@ -585,21 +801,29 @@ func newDecoder(r io.Reader) (*decoder, error) {
 			d.config.ColorModel = color.GrayModel
 		}
 	default:
-		return nil, UnsupportedError("color model")
+		return UnsupportedError("color model")
 	}
 	if d.firstVal(tPhotometricInterpretation) != pRGB {
 		if len(d.features[tBitsPerSample]) != 1 {
-			return nil, UnsupportedError("extra samples")
+			return UnsupportedError("extra samples")
 		}
 	}
 
-	return d, nil
+	return nil
 }
 
 // DecodeConfig returns the color model and dimensions of a TIFF image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	d, err := newDecoder(r)
+	return DecodeConfigWithOptions(r, nil)
+}
+
+// DecodeConfigWithOptions is like DecodeConfig but takes the same options as
+// Decode. The options affect the reported color model for floating-point
+// pages: BitDepth selects an 8-bit or 16-bit model, and gray plus alpha pages
+// report an RGBA-like model.
+func DecodeConfigWithOptions(r io.Reader, opt *DecodeOptions) (image.Config, error) {
+	d, err := newDecoderPage(r, 0, opt)
 	if err != nil {
 		return image.Config{}, err
 	}
@@ -616,7 +840,70 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 // Decode reads a TIFF image from r and returns it as an image.Image.
 // The type of Image returned depends on the contents of the TIFF.
 func Decode(r io.Reader) (img image.Image, err error) {
-	d, err := newDecoder(r)
+	return DecodeWithOptions(r, nil)
+}
+
+// DecodeWithOptions is like Decode but takes options that control how
+// IEEE floating-point samples are converted to integer image types.
+//
+// Integer pages decode identically whether or not options are passed, apart
+// from the extra validation of the Float options. For a floating-point page
+// the returned image is *image.Gray (or *image.Gray16), *image.RGBA (or
+// *image.RGBA64), or *image.NRGBA (or *image.NRGBA64), as selected by
+// FloatOptions.BitDepth and the ExtraSamples tag.
+func DecodeWithOptions(r io.Reader, opt *DecodeOptions) (img image.Image, err error) {
+	return decodePage(r, 0, opt)
+}
+
+// DecodePageWithOptions is like DecodeWithOptions but decodes the page with
+// the given zero-based index. Errors include a *PageError identifying the
+// page (and, where applicable, the sample channel).
+func DecodePageWithOptions(r io.Reader, page int, opt *DecodeOptions) (image.Image, error) {
+	if page < 0 {
+		return nil, makePageError(page, -1, errors.New("negative page index"))
+	}
+	return decodePage(r, page, opt)
+}
+
+// NumPages returns the number of pages (IFDs) in the TIFF image.
+func NumPages(r io.Reader) (int, error) {
+	d := &decoder{
+		r:        newReaderAt(r),
+		features: make(map[int][]uint),
+	}
+	p := make([]byte, 8)
+	if _, err := d.r.ReadAt(p, 0); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, err
+	}
+	switch string(p[0:4]) {
+	case leHeader:
+		d.byteOrder = binary.LittleEndian
+	case beHeader:
+		d.byteOrder = binary.BigEndian
+	default:
+		return 0, FormatError("malformed header")
+	}
+	off := int64(d.byteOrder.Uint32(p[4:8]))
+	n := 0
+	for off != 0 {
+		next, err := d.nextIFDOffset(off)
+		if err != nil {
+			return 0, err
+		}
+		off = next
+		n++
+		if n > 1<<16 {
+			return 0, FormatError("too many pages")
+		}
+	}
+	return n, nil
+}
+
+func decodePage(r io.Reader, page int, opt *DecodeOptions) (img image.Image, err error) {
+	d, err := newDecoderPage(r, page, opt)
 	if err != nil {
 		return
 	}
@@ -678,34 +965,73 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	}
 
 	imgRect := image.Rect(0, 0, d.config.Width, d.config.Height)
-	switch d.mode {
-	case mGray, mGrayInvert:
-		if d.bpp == 16 {
-			img = image.NewGray16(imgRect)
-		} else {
-			img = image.NewGray(imgRect)
+	if d.isFloat {
+		switch d.mode {
+		case mGray, mGrayInvert:
+			if d.outBits == 16 {
+				img = image.NewGray16(imgRect)
+			} else {
+				img = image.NewGray(imgRect)
+			}
+		case mNRGBA:
+			if d.outBits == 16 {
+				img = image.NewNRGBA64(imgRect)
+			} else {
+				img = image.NewNRGBA(imgRect)
+			}
+		case mRGB, mRGBA:
+			if d.outBits == 16 {
+				img = image.NewRGBA64(imgRect)
+			} else {
+				img = image.NewRGBA(imgRect)
+			}
 		}
-	case mPaletted:
-		img = image.NewPaletted(imgRect, d.palette)
-	case mNRGBA:
-		if d.bpp == 16 {
-			img = image.NewNRGBA64(imgRect)
-		} else {
-			img = image.NewNRGBA(imgRect)
-		}
-	case mRGB, mRGBA:
-		if d.bpp == 16 {
-			img = image.NewRGBA64(imgRect)
-		} else {
-			img = image.NewRGBA(imgRect)
+	} else {
+		switch d.mode {
+		case mGray, mGrayInvert:
+			if d.bpp == 16 {
+				img = image.NewGray16(imgRect)
+			} else {
+				img = image.NewGray(imgRect)
+			}
+		case mPaletted:
+			img = image.NewPaletted(imgRect, d.palette)
+		case mNRGBA:
+			if d.bpp == 16 {
+				img = image.NewNRGBA64(imgRect)
+			} else {
+				img = image.NewNRGBA(imgRect)
+			}
+		case mRGB, mRGBA:
+			if d.bpp == 16 {
+				img = image.NewRGBA64(imgRect)
+			} else {
+				img = image.NewRGBA(imgRect)
+			}
 		}
 	}
 
 	if blocksAcross == 0 || blocksDown == 0 {
 		return
 	}
-	// Maximum data per pixel is 8 bytes (RGBA64).
-	blockMaxDataSize := int64(blockWidth) * int64(blockHeight) * 8
+	// Maximum data per pixel is 8 bytes (RGBA64), or the actual sample size
+	// for floating point pages (4 samples at up to 64 bits each). Bounding
+	// the decompression limit by the block's true geometry only limits how
+	// much a malicious compressed stream can expand to.
+	bytesPerPixel := int64(8)
+	if d.isFloat {
+		var ok bool
+		if bytesPerPixel, ok = checkedMul(int64(d.samples), int64(d.floatBytes)); !ok {
+			return nil, d.pageError(-1, FormatError("sample count overflow"))
+		}
+	}
+	blockMaxDataSize, ok := checkedMul(int64(blockWidth), int64(blockHeight))
+	if ok {
+		blockMaxDataSize, ok = checkedMul(blockMaxDataSize, bytesPerPixel)
+	}
+	if !ok || int64(int(blockMaxDataSize)) != blockMaxDataSize {
+		return nil, d.pageError(-1, FormatError("block size overflow"))
+	}
 	for i := 0; i < blocksAcross; i++ {
 		blkW := blockWidth
 		if !blockPadding && i == blocksAcross-1 && d.config.Width%blockWidth != 0 {
@@ -746,15 +1072,29 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			case cDeflate, cDeflateOld:
 				var r io.ReadCloser
 				r, err = zlib.NewReader(io.NewSectionReader(d.r, offset, n))
-				if err != nil {
-					return nil, err
+				if err == nil {
+					d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
+					r.Close()
 				}
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-				r.Close()
 			case cPackBits:
-				d.buf, err = unpackBits(io.NewSectionReader(d.r, offset, n))
+				// unpackBits does not take the block geometry, so bound its
+				// output the same way as the other decompressors.
+				var b []byte
+				b, err = unpackBits(io.NewSectionReader(d.r, offset, n))
+				if err == nil {
+					if int64(len(b)) > blockMaxDataSize {
+						err = errNoPixels
+					} else {
+						d.buf = b
+					}
+				}
 			default:
 				err = UnsupportedError(fmt.Sprintf("compression value %d", d.firstVal(tCompression)))
+			}
+			// Only attach page/channel context on the floating-point path, so
+			// that integer decoding errors and their values are unchanged.
+			if d.isFloat {
+				err = makePageError(d.page, -1, err)
 			}
 			if err != nil {
 				return nil, err
@@ -764,7 +1104,11 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			ymin := j * blockHeight
 			xmax := xmin + blkW
 			ymax := ymin + blkH
-			err = d.decode(img, xmin, ymin, xmax, ymax)
+			if d.isFloat {
+				err = d.decodeFloat(img, xmin, ymin, xmax, ymax)
+			} else {
+				err = d.decode(img, xmin, ymin, xmax, ymax)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -782,4 +1126,29 @@ func readBuf(r io.Reader, buf []byte, lim int64) ([]byte, error) {
 func init() {
 	image.RegisterFormat("tiff", leHeader, Decode, DecodeConfig)
 	image.RegisterFormat("tiff", beHeader, Decode, DecodeConfig)
+}
+
+// ifdIsFloat reports whether the raw IFD entries p contain a SampleFormat tag
+// that declares IEEE floating point samples. It runs before the IFD has been
+// fully parsed, solely to decide whether to attach page context to an error.
+func (d *decoder) ifdIsFloat(p []byte) bool {
+	for i := 0; i+ifdLen <= len(p); i += ifdLen {
+		if d.byteOrder.Uint16(p[i:]) != tSampleFormat {
+			continue
+		}
+		typ := d.byteOrder.Uint16(p[i+2:])
+		count := d.byteOrder.Uint32(p[i+4:])
+		if typ != dtShort || count == 0 || count > 4/2 {
+			// Either not inline, or not the layout a float page uses. Such a
+			// page will fail to parse for other reasons; context does not
+			// matter.
+			continue
+		}
+		for k := uint32(0); k < count; k++ {
+			if d.byteOrder.Uint16(p[i+8+2*int(k):]) == sfFloat {
+				return true
+			}
+		}
+	}
+	return false
 }
