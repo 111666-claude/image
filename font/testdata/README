@@ -1,2 +1,19 @@
 CFFTest.sfd is a FontForge file for creating CFFTest.otf, a custom OpenType
 font for testing the golang.org/x/image/font/sfnt package's CFF support.
+
+verticalTest.py is a fontTools script for creating verticalTest.ttf,
+verticalTestNoVhea.ttf, verticalTest.ttc and verticalTestCFF.otf, custom fonts
+for testing the golang.org/x/image/font/sfnt package's vhea/vmtx support:
+
+  - verticalTest.ttf is a TrueType font with a vhea table (version 1.1) and a
+    vmtx table. Its eight glyphs exercise full and trailing-array side
+    bearings, including two negative top side bearings.
+  - verticalTestNoVhea.ttf has the same outlines and horizontal tables but
+    neither vertical table.
+  - verticalTest.ttc is a collection of the two above.
+  - verticalTestCFF.otf is a CFF-flavored font with the same vertical metrics.
+
+mplus1p-subset.ttf is a small subset (only the glyphs needed by the tests) of
+M PLUS 1p Regular, a real CJK font, carrying M PLUS 1p's original vhea and vmtx
+tables. M PLUS 1p is distributed under the SIL Open Font License 1.1; see
+https://github.com/coz-m/MPLUS_FONTS.

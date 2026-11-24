@@ -93,30 +93,34 @@ var (
 	// ErrNotFound indicates that the requested value was not found.
 	ErrNotFound = errors.New("sfnt: not found")
 
-	errInvalidBounds          = errors.New("sfnt: invalid bounds")
-	errInvalidCFFTable        = errors.New("sfnt: invalid CFF table")
-	errInvalidCmapTable       = errors.New("sfnt: invalid cmap table")
-	errInvalidDfont           = errors.New("sfnt: invalid dfont")
-	errInvalidFont            = errors.New("sfnt: invalid font")
-	errInvalidFontCollection  = errors.New("sfnt: invalid font collection")
-	errInvalidGPOSTable       = errors.New("sfnt: invalid GPOS table")
-	errInvalidGlyphData       = errors.New("sfnt: invalid glyph data")
-	errInvalidGlyphDataLength = errors.New("sfnt: invalid glyph data length")
-	errInvalidHeadTable       = errors.New("sfnt: invalid head table")
-	errInvalidHheaTable       = errors.New("sfnt: invalid hhea table")
-	errInvalidHmtxTable       = errors.New("sfnt: invalid hmtx table")
-	errInvalidKernTable       = errors.New("sfnt: invalid kern table")
-	errInvalidLocaTable       = errors.New("sfnt: invalid loca table")
-	errInvalidLocationData    = errors.New("sfnt: invalid location data")
-	errInvalidMaxpTable       = errors.New("sfnt: invalid maxp table")
-	errInvalidNameTable       = errors.New("sfnt: invalid name table")
-	errInvalidOS2Table        = errors.New("sfnt: invalid OS/2 table")
-	errInvalidPostTable       = errors.New("sfnt: invalid post table")
-	errInvalidSingleFont      = errors.New("sfnt: invalid single font (data is a font collection)")
-	errInvalidSourceData      = errors.New("sfnt: invalid source data")
-	errInvalidTableOffset     = errors.New("sfnt: invalid table offset")
-	errInvalidTableTagOrder   = errors.New("sfnt: invalid table tag order")
-	errInvalidUCS2String      = errors.New("sfnt: invalid UCS-2 string")
+	errInvalidBounds           = errors.New("sfnt: invalid bounds")
+	errInvalidCFFTable         = errors.New("sfnt: invalid CFF table")
+	errInvalidCmapTable        = errors.New("sfnt: invalid cmap table")
+	errInvalidDfont            = errors.New("sfnt: invalid dfont")
+	errInvalidFont             = errors.New("sfnt: invalid font")
+	errInvalidFontCollection   = errors.New("sfnt: invalid font collection")
+	errInvalidGPOSTable        = errors.New("sfnt: invalid GPOS table")
+	errInvalidGlyphData        = errors.New("sfnt: invalid glyph data")
+	errInvalidGlyphDataLength  = errors.New("sfnt: invalid glyph data length")
+	errInvalidHeadTable        = errors.New("sfnt: invalid head table")
+	errInvalidHheaTable        = errors.New("sfnt: invalid hhea table")
+	errInvalidHmtxTable        = errors.New("sfnt: invalid hmtx table")
+	errInvalidKernTable        = errors.New("sfnt: invalid kern table")
+	errInvalidLocaTable        = errors.New("sfnt: invalid loca table")
+	errInvalidLocationData     = errors.New("sfnt: invalid location data")
+	errInvalidMaxpTable        = errors.New("sfnt: invalid maxp table")
+	errInvalidNameTable        = errors.New("sfnt: invalid name table")
+	errInvalidOS2Table         = errors.New("sfnt: invalid OS/2 table")
+	errInvalidPostTable        = errors.New("sfnt: invalid post table")
+	errInvalidSingleFont       = errors.New("sfnt: invalid single font (data is a font collection)")
+	errInvalidSourceData       = errors.New("sfnt: invalid source data")
+	errInvalidTableOffset      = errors.New("sfnt: invalid table offset")
+	errInvalidTableTagOrder    = errors.New("sfnt: invalid table tag order")
+	errInvalidUCS2String       = errors.New("sfnt: invalid UCS-2 string")
+	errInvalidUnitsPerEm       = errors.New("sfnt: invalid units per em")
+	errInvalidVheaTable        = errors.New("sfnt: invalid vhea table")
+	errInvalidVmtxTable        = errors.New("sfnt: invalid vmtx table")
+	errVerticalMetricsOverflow = errors.New("sfnt: vertical metrics overflow")
 
 	errUnsupportedCFFFDSelectTable     = errors.New("sfnt: unsupported CFF FDSelect table")
 	errUnsupportedCFFVersion           = errors.New("sfnt: unsupported CFF version")
@@ -646,8 +650,16 @@ type Font struct {
 	// https://www.microsoft.com/typography/otspec/otff.htm#otttables
 	// "Other OpenType Tables".
 	//
-	// TODO: hdmx, vmtx? Others?
+	// TODO: hdmx, VORG? Others?
 	kern table
+
+	// The vertical metrics tables are optional. Fonts intended for vertical
+	// (typically CJK) layout should contain both of them.
+	//
+	// https://www.microsoft.com/typography/otspec/vhea.htm
+	// https://www.microsoft.com/typography/otspec/vmtx.htm
+	vhea table
+	vmtx table
 
 	cached struct {
 		ascent           int32
@@ -669,6 +681,14 @@ type Font struct {
 		slope            [2]int32
 		unitsPerEm       Units
 		xHeight          int32
+
+		// vertical is the parsed vertical metrics. verticalErr is non-nil if
+		// the font's vertical metrics tables are present but malformed. Such
+		// an error is cached instead of being returned by Parse so that the
+		// horizontal APIs remain usable; the vertical metrics methods report
+		// it.
+		vertical    verticalData
+		verticalErr error
 	}
 }
 
@@ -735,6 +755,11 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
+	// A malformed vertical metrics table pair does not prevent the font from
+	// being used for horizontal layout, so its error is cached, not returned.
+	// The vertical metrics methods report it. verticalData is only meaningful
+	// when verticalErr is nil.
+	_, vertical, verticalErr := f.parseVertical(buf, numGlyphs)
 
 	f.cached.ascent = ascent
 	f.cached.capHeight = capHeight
@@ -755,6 +780,8 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.slope = [2]int32{run, rise}
 	f.cached.unitsPerEm = unitsPerEm
 	f.cached.xHeight = xHeight
+	f.cached.vertical = vertical
+	f.cached.verticalErr = verticalErr
 
 	if !hasXHeightCapHeight {
 		xh, ch, err := f.initOS2VersionBelow2()
@@ -868,6 +895,10 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, finalTab
 			f.name = table{o, n}
 		case 0x706f7374:
 			f.post = table{o, n}
+		case 0x76686561:
+			f.vhea = table{o, n}
+		case 0x766d7478:
+			f.vmtx = table{o, n}
 		}
 	}
 
