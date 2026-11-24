@@ -144,6 +144,16 @@ type Decoder struct {
 	// Their specific sizes are documented in reconstruct.go.
 	coeff [1*16*16 + 2*8*8 + 1*4*4]int16
 	ybr   [1 + 16 + 1 + 8][32]uint8
+
+	// region is non-zero when decoding only a band of macroblock rows. In
+	// that mode img is a two-macroblock-row-tall window (see region.go)
+	// instead of the full frame, and the unfiltered bottom pixel row of the
+	// row above the current row is kept in rawAboveY, rawAboveCb and
+	// rawAboveCr for the predictors.
+	region     bool
+	rawAboveY  []byte
+	rawAboveCb []byte
+	rawAboveCr []byte
 }
 
 // NewDecoder returns a new Decoder.
@@ -196,6 +206,7 @@ func (d *Decoder) DecodeFrameHeader() (fh FrameHeader, err error) {
 
 // ensureImg ensures that d.img is large enough to hold the decoded frame.
 func (d *Decoder) ensureImg() {
+	d.region = false
 	if d.img != nil {
 		p0, p1 := d.img.Rect.Min, d.img.Rect.Max
 		if p0.X == 0 && p0.Y == 0 && p1.X >= 16*d.mbw && p1.Y >= 16*d.mbh {

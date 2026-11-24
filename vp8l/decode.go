@@ -10,6 +10,7 @@ package vp8l // import "golang.org/x/image/vp8l"
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -20,6 +21,41 @@ var (
 	errInvalidCodeLengths = errors.New("vp8l: invalid code lengths")
 	errInvalidHuffmanTree = errors.New("vp8l: invalid Huffman tree")
 )
+
+// ErrMemoryLimitExceeded is returned when a region decode would allocate more
+// than the caller-supplied memory limit.
+var ErrMemoryLimitExceeded = errors.New("vp8l: memory limit exceeded")
+
+// memAccount tracks the cumulative amount of memory charged against a limit.
+// It is only used by region decoding and is not safe for concurrent use.
+type memAccount struct {
+	used  int64
+	limit int64
+}
+
+// charge records n additional bytes and reports ErrMemoryLimitExceeded if the
+// cumulative total would exceed the limit. Non-positive n is a no-op, and a
+// nil account charges nothing, which preserves the unbounded full-image
+// Decode path.
+func (a *memAccount) charge(n int64) error {
+	if a == nil || n <= 0 {
+		return nil
+	}
+	if a.limit-a.used < n {
+		return ErrMemoryLimitExceeded
+	}
+	a.used += n
+	return nil
+}
+
+// maxRegionRingPixels bounds the region decoder's rolling pixel ring. A
+// VP8L backwards reference distance is either a two-dimensional offset of at
+// most 127 pixels, or a literal linear distance encoded in up to 24 bits.
+// Keeping 1<<20 pixels (4 MiB of RGBA) in the ring covers every reference that
+// the encoder can emit in practice while fixing its footprint; references
+// farther back than the ring are rejected as invalid, exactly as they would be
+// if they pointed outside the already-decoded prefix.
+const maxRegionRingPixels = 1 << 20
 
 // colorCacheMultiplier is the multiplier used for the color cache hash
 // function, specified in section 4.2.3.
@@ -61,6 +97,11 @@ type decoder struct {
 	r     io.ByteReader
 	bits  uint32
 	nBits uint32
+
+	// acc, if non-nil, charges decoder allocations against a memory limit.
+	acc *memAccount
+	// ctx, if non-nil, is checked for cancellation between rows.
+	ctx context.Context
 }
 
 // read reads the next n bits from the decoder's bit-stream.
@@ -271,6 +312,9 @@ func (d *decoder) decodeHuffmanTree(h *hTree, alphabetSize uint32) error {
 		}
 	}
 	codeLengths := make([]uint32, alphabetSize)
+	if err := d.acc.charge(int64(alphabetSize) * 4); err != nil {
+		return err
+	}
 	if err = d.decodeCodeLengths(codeLengths, codeLengthCodeLengths[:]); err != nil {
 		return err
 	}
@@ -320,6 +364,12 @@ func (d *decoder) decodeHuffmanGroups(w int32, h int32, topLevel bool, ccBits ui
 			}
 		}
 	}
+	// Charge the group table before allocating it, so a stream that declares
+	// many groups is rejected by the memory limit without ever allocating the
+	// full slice.
+	if err := d.acc.charge(int64(maxHGroupIndex+1) * int64(hGroupBytes)); err != nil {
+		return nil, nil, 0, err
+	}
 	hGroups = make([]hGroup, maxHGroupIndex+1)
 	for i := range hGroups {
 		for j, alphabetSize := range alphabetSizes {
@@ -348,6 +398,10 @@ var alphabetSizes = [nHuff]uint32{
 	nDistanceCodes,
 }
 
+// hGroupBytes is the size of one hGroup: five Huffman trees, each dominated by
+// its 128-entry look-up table.
+const hGroupBytes = nHuff*(1<<lutSize)*4 + nHuff*64
+
 // decodePix decodes pixel data, specified in section 5.2.2.
 func (d *decoder) decodePix(w int32, h int32, minCap int32, topLevel bool) ([]byte, error) {
 	// Decode the color cache parameters.
@@ -365,6 +419,9 @@ func (d *decoder) decodePix(w int32, h int32, minCap int32, topLevel bool) ([]by
 			return nil, errors.New("vp8l: invalid color cache parameters")
 		}
 		ccShift = 32 - ccBits
+		if err := d.acc.charge(int64(1<<ccBits) * 4); err != nil {
+			return nil, err
+		}
 		ccEntries = make([]uint32, 1<<ccBits)
 	}
 
@@ -381,6 +438,9 @@ func (d *decoder) decodePix(w int32, h int32, minCap int32, topLevel bool) ([]by
 	// Decode the pixels.
 	if minCap < 4*w*h {
 		minCap = 4 * w * h
+	}
+	if err := d.acc.charge(int64(minCap)); err != nil {
+		return nil, err
 	}
 	pix := make([]byte, 4*w*h, minCap)
 	p, cachedP := 0, 0

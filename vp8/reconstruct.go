@@ -113,6 +113,29 @@ func (d *Decoder) prepareYBR(mbx, mby int) {
 		for x := 23; x < 32; x++ {
 			d.ybr[17][x] = 0x7f
 		}
+	} else if d.region {
+		// In region mode the row above is not the image row 16*mby-1 but the
+		// unfiltered copy saved in rawAboveY (etc), because the one-shot
+		// decoder filters only after the whole frame is reconstructed, while a
+		// region decode filters as it goes.
+		for i := 0; i < 16; i++ {
+			d.ybr[0][8+i] = d.rawAboveY[16*mbx+i]
+		}
+		for i := 0; i < 8; i++ {
+			d.ybr[17][8+i] = d.rawAboveCb[8*mbx+i]
+		}
+		for i := 0; i < 8; i++ {
+			d.ybr[17][24+i] = d.rawAboveCr[8*mbx+i]
+		}
+		if mbx == d.mbw-1 {
+			for i := 16; i < 20; i++ {
+				d.ybr[0][8+i] = d.rawAboveY[16*mbx+15]
+			}
+		} else {
+			for i := 16; i < 20; i++ {
+				d.ybr[0][8+i] = d.rawAboveY[16*mbx+i]
+			}
+		}
 	} else {
 		for i := 0; i < 16; i++ {
 			d.ybr[0][8+i] = d.img.Y[(16*mby-1)*d.img.YStride+16*mbx+i]
@@ -429,12 +452,20 @@ func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
 		d.nzDCMask = 0
 		d.nzACMask = 0
 	}
-	// Reconstruct the YCbCr data and copy it to the image.
+	// Reconstruct the YCbCr data and copy it to the image. In region mode the
+	// reconstructed rows live in the second bank of the rolling window; in a
+	// full-frame decode they are written at their final position.
+	yBase := (mby*d.img.YStride + mbx) * 16
+	cBase := (mby*d.img.CStride + mbx) * 8
+	if d.region {
+		yBase = 16*d.img.YStride + 16*mbx
+		cBase = 8*d.img.CStride + 8*mbx
+	}
 	d.reconstructMacroblock(mbx, mby)
-	for i, y := (mby*d.img.YStride+mbx)*16, 0; y < 16; i, y = i+d.img.YStride, y+1 {
+	for i, y := yBase, 0; y < 16; i, y = i+d.img.YStride, y+1 {
 		copy(d.img.Y[i:i+16], d.ybr[ybrYY+y][ybrYX:ybrYX+16])
 	}
-	for i, y := (mby*d.img.CStride+mbx)*8, 0; y < 8; i, y = i+d.img.CStride, y+1 {
+	for i, y := cBase, 0; y < 8; i, y = i+d.img.CStride, y+1 {
 		copy(d.img.Cb[i:i+8], d.ybr[ybrBY+y][ybrBX:ybrBX+8])
 		copy(d.img.Cr[i:i+8], d.ybr[ybrRY+y][ybrRX:ybrRX+8])
 	}
