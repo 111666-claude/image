@@ -173,6 +173,7 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		tStripOffsets,
 		tStripByteCounts,
 		tRowsPerStrip,
+		tPlanarConfiguration,
 		tTileWidth,
 		tTileLength,
 		tTileOffsets,
@@ -240,9 +241,9 @@ func (d *decoder) readBits(n uint) (v uint32, ok bool) {
 	return rv, true
 }
 
-// flushBits discards the unread bits in the buffer used by readBits.
-// It is used at the end of a line.
-func (d *decoder) flushBits() {
+// flushRow discards the bits of the current packed row and aligns the bit
+// stream to the start of the next row.
+func (d *decoder) flushRow() {
 	d.v = 0
 	d.nbits = 0
 }
@@ -255,8 +256,19 @@ func minInt(a, b int) int {
 	return b
 }
 
-// decode decodes the raw data of an image.
-// It reads from d.buf and writes the strip or tile into dst.
+// maxInt returns the larger of x or y.
+func maxInt(a, b int) int {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+// decode decodes the raw data of one strip or tile from d.buf and writes the
+// pixels that fall inside dst.Bounds() into dst. The block covers the
+// rectangle with top-left corner (xmin, ymin) and size (xmax-xmin) by
+// (ymax-ymin). Tile blocks may extend past the right and bottom edges of the
+// image; the padding pixels are consumed but never written.
 func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	d.off = 0
 
@@ -298,14 +310,25 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 		}
 	}
 
-	rMaxX := minInt(xmax, dst.Bounds().Max.X)
-	rMaxY := minInt(ymax, dst.Bounds().Max.Y)
+	// Only the intersection of the block and the destination is materialized.
+	// Pixels outside of it are still consumed from d.buf, but never written.
+	b := dst.Bounds()
+	rMinX := maxInt(xmin, b.Min.X)
+	rMinY := maxInt(ymin, b.Min.Y)
+	rMaxX := minInt(xmax, b.Max.X)
+	rMaxY := minInt(ymax, b.Max.Y)
+	if rMinX >= rMaxX || rMinY >= rMaxY {
+		return nil
+	}
+
 	switch d.mode {
 	case mGray, mGrayInvert:
 		if d.bpp == 16 {
 			img := dst.(*image.Gray16)
-			for y := ymin; y < rMaxY; y++ {
-				for x := xmin; x < rMaxX; x++ {
+			rowBytes := (xmax - xmin) * 2
+			for y := rMinY; y < rMaxY; y++ {
+				d.off = (y-ymin)*rowBytes + (rMinX-xmin)*2
+				for x := rMinX; x < rMaxX; x++ {
 					if d.off+2 > len(d.buf) {
 						return errNoPixels
 					}
@@ -316,15 +339,19 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					}
 					img.SetGray16(x, y, color.Gray16{v})
 				}
-				if rMaxX == img.Bounds().Max.X {
-					d.off += 2 * (xmax - img.Bounds().Max.X)
-				}
 			}
 		} else {
 			img := dst.(*image.Gray)
 			max := uint32((1 << d.bpp) - 1)
 			for y := ymin; y < rMaxY; y++ {
-				for x := xmin; x < rMaxX; x++ {
+				// Packed rows are not necessarily byte-aligned (CCITT data is
+				// not), so the bit stream is consumed sequentially.
+				for x := xmin; x < rMinX; x++ {
+					if _, ok := d.readBits(d.bpp); !ok {
+						return errNoPixels
+					}
+				}
+				for x := rMinX; x < rMaxX; x++ {
 					v, ok := d.readBits(d.bpp)
 					if !ok {
 						return errNoPixels
@@ -335,14 +362,25 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					}
 					img.SetGray(x, y, color.Gray{uint8(v)})
 				}
-				d.flushBits()
+				// Consume the trailing padding pixels of the block row.
+				for x := rMaxX; x < xmax; x++ {
+					if _, ok := d.readBits(d.bpp); !ok {
+						return errNoPixels
+					}
+				}
+				d.flushRow()
 			}
 		}
 	case mPaletted:
 		img := dst.(*image.Paletted)
 		pLen := len(d.palette)
 		for y := ymin; y < rMaxY; y++ {
-			for x := xmin; x < rMaxX; x++ {
+			for x := xmin; x < rMinX; x++ {
+				if _, ok := d.readBits(d.bpp); !ok {
+					return errNoPixels
+				}
+			}
+			for x := rMinX; x < rMaxX; x++ {
 				v, ok := d.readBits(d.bpp)
 				if !ok {
 					return errNoPixels
@@ -353,13 +391,20 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				}
 				img.SetColorIndex(x, y, idx)
 			}
-			d.flushBits()
+			for x := rMaxX; x < xmax; x++ {
+				if _, ok := d.readBits(d.bpp); !ok {
+					return errNoPixels
+				}
+			}
+			d.flushRow()
 		}
 	case mRGB:
 		if d.bpp == 16 {
 			img := dst.(*image.RGBA64)
-			for y := ymin; y < rMaxY; y++ {
-				for x := xmin; x < rMaxX; x++ {
+			rowBytes := (xmax - xmin) * 6
+			for y := rMinY; y < rMaxY; y++ {
+				d.off = (y-ymin)*rowBytes + (rMinX-xmin)*6
+				for x := rMinX; x < rMaxX; x++ {
 					if d.off+6 > len(d.buf) {
 						return errNoPixels
 					}
@@ -372,10 +417,11 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			}
 		} else {
 			img := dst.(*image.RGBA)
-			for y := ymin; y < rMaxY; y++ {
-				min := img.PixOffset(xmin, y)
+			rowBytes := (xmax - xmin) * 3
+			for y := rMinY; y < rMaxY; y++ {
+				min := img.PixOffset(rMinX, y)
 				max := img.PixOffset(rMaxX, y)
-				off := (y - ymin) * (xmax - xmin) * 3
+				off := (y-ymin)*rowBytes + (rMinX-xmin)*3
 				for i := min; i < max; i += 4 {
 					if off+3 > len(d.buf) {
 						return errNoPixels
@@ -391,8 +437,10 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	case mNRGBA:
 		if d.bpp == 16 {
 			img := dst.(*image.NRGBA64)
-			for y := ymin; y < rMaxY; y++ {
-				for x := xmin; x < rMaxX; x++ {
+			rowBytes := (xmax - xmin) * 8
+			for y := rMinY; y < rMaxY; y++ {
+				d.off = (y-ymin)*rowBytes + (rMinX-xmin)*8
+				for x := rMinX; x < rMaxX; x++ {
 					if d.off+8 > len(d.buf) {
 						return errNoPixels
 					}
@@ -406,10 +454,12 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			}
 		} else {
 			img := dst.(*image.NRGBA)
-			for y := ymin; y < rMaxY; y++ {
-				min := img.PixOffset(xmin, y)
+			rowBytes := (xmax - xmin) * 4
+			for y := rMinY; y < rMaxY; y++ {
+				min := img.PixOffset(rMinX, y)
 				max := img.PixOffset(rMaxX, y)
-				i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
+				i0 := (y-ymin)*rowBytes + (rMinX-xmin)*4
+				i1 := i0 + (rMaxX-rMinX)*4
 				if i1 > len(d.buf) {
 					return errNoPixels
 				}
@@ -419,8 +469,10 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	case mRGBA:
 		if d.bpp == 16 {
 			img := dst.(*image.RGBA64)
-			for y := ymin; y < rMaxY; y++ {
-				for x := xmin; x < rMaxX; x++ {
+			rowBytes := (xmax - xmin) * 8
+			for y := rMinY; y < rMaxY; y++ {
+				d.off = (y-ymin)*rowBytes + (rMinX-xmin)*8
+				for x := rMinX; x < rMaxX; x++ {
 					if d.off+8 > len(d.buf) {
 						return errNoPixels
 					}
@@ -434,10 +486,12 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			}
 		} else {
 			img := dst.(*image.RGBA)
-			for y := ymin; y < rMaxY; y++ {
-				min := img.PixOffset(xmin, y)
+			rowBytes := (xmax - xmin) * 4
+			for y := rMinY; y < rMaxY; y++ {
+				min := img.PixOffset(rMinX, y)
 				max := img.PixOffset(rMaxX, y)
-				i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
+				i0 := (y-ymin)*rowBytes + (rMinX-xmin)*4
+				i1 := i0 + (rMaxX-rMinX)*4
 				if i1 > len(d.buf) {
 					return errNoPixels
 				}
@@ -449,9 +503,9 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	return nil
 }
 
-func newDecoder(r io.Reader) (*decoder, error) {
+func newDecoder(r io.ReaderAt) (*decoder, error) {
 	d := &decoder{
-		r:        newReaderAt(r),
+		r:        r,
 		features: make(map[int][]uint),
 	}
 
@@ -593,13 +647,29 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		}
 	}
 
+	// The PlanarConfiguration tag defaults to chunky (1) when absent.
+	switch pc := d.firstVal(tPlanarConfiguration); pc {
+	case 0, pcChunky:
+	case pcPlanar:
+		// Planar (separate sample planes) data is only meaningful for
+		// multi-sample RGB images.
+		if len(d.features[tBitsPerSample]) < 2 {
+			return nil, FormatError("planar configuration with a single sample")
+		}
+		if d.mode != mRGB && d.mode != mRGBA && d.mode != mNRGBA {
+			return nil, UnsupportedError("planar configuration for color model")
+		}
+	default:
+		return nil, UnsupportedError("planar configuration")
+	}
+
 	return d, nil
 }
 
 // DecodeConfig returns the color model and dimensions of a TIFF image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	d, err := newDecoder(r)
+	d, err := newDecoder(newReaderAt(r))
 	if err != nil {
 		return image.Config{}, err
 	}
@@ -613,164 +683,424 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 	return ccitt.MSB
 }
 
-// Decode reads a TIFF image from r and returns it as an image.Image.
-// The type of Image returned depends on the contents of the TIFF.
-func Decode(r io.Reader) (img image.Image, err error) {
-	d, err := newDecoder(r)
-	if err != nil {
-		return
+// blockLayout describes how the pixel data is partitioned into strips or
+// tiles.
+type blockLayout struct {
+	tile         bool
+	blockWidth   int
+	blockHeight  int
+	blocksAcross int
+	blocksDown   int
+	// blockPadding reports whether the blocks on the right and bottom edges
+	// are padded to the full block size. This is true for tiled images.
+	blockPadding bool
+	blockOffsets []uint
+	blockCounts  []uint
+}
+
+// layout computes the strip or tile layout of the image and validates that the
+// IFD declares enough offsets and byte counts for every block.
+func (d *decoder) layout() (blockLayout, error) {
+	l := blockLayout{
+		blockWidth:   d.config.Width,
+		blockHeight:  d.config.Height,
+		blocksAcross: 1,
+		blocksDown:   1,
 	}
-
-	blockPadding := false
-	blockWidth := d.config.Width
-	blockHeight := d.config.Height
-	blocksAcross := 1
-	blocksDown := 1
-
 	if d.config.Width == 0 {
-		blocksAcross = 0
+		l.blocksAcross = 0
 	}
 	if d.config.Height == 0 {
-		blocksDown = 0
+		l.blocksDown = 0
+	}
+	// An image with no pixels has no blocks to validate or read; return before
+	// checking tile dimensions so that degenerate (e.g. zero-length) tiles are
+	// not rejected when there is nothing for them to hold.
+	if l.blocksAcross == 0 || l.blocksDown == 0 {
+		return l, nil
 	}
 
-	var blockOffsets, blockCounts []uint
-
 	if int(d.firstVal(tTileWidth)) != 0 {
-		blockPadding = true
+		l.tile = true
+		l.blockPadding = true
 
-		blockWidth = int(d.firstVal(tTileWidth))
-		blockHeight = int(d.firstVal(tTileLength))
+		l.blockWidth = int(d.firstVal(tTileWidth))
+		l.blockHeight = int(d.firstVal(tTileLength))
 
 		// The specification says that tile widths and lengths must be a multiple of 16.
 		// We currently permit invalid sizes, but reject anything too small to limit the
 		// amount of work a malicious input can force us to perform.
-		if blockWidth < 8 || blockHeight < 8 {
-			return nil, FormatError("tile size is too small")
+		if l.blockWidth < 8 || l.blockHeight < 8 {
+			return l, FormatError("tile size is too small")
 		}
 
-		if blockWidth != 0 {
-			blocksAcross = (d.config.Width + blockWidth - 1) / blockWidth
+		if l.blockWidth != 0 {
+			l.blocksAcross = (d.config.Width + l.blockWidth - 1) / l.blockWidth
 		}
-		if blockHeight != 0 {
-			blocksDown = (d.config.Height + blockHeight - 1) / blockHeight
+		if l.blockHeight != 0 {
+			l.blocksDown = (d.config.Height + l.blockHeight - 1) / l.blockHeight
 		}
 
-		blockCounts = d.features[tTileByteCounts]
-		blockOffsets = d.features[tTileOffsets]
-
+		l.blockCounts = d.features[tTileByteCounts]
+		l.blockOffsets = d.features[tTileOffsets]
 	} else {
 		if int(d.firstVal(tRowsPerStrip)) != 0 {
-			blockHeight = int(d.firstVal(tRowsPerStrip))
+			l.blockHeight = int(d.firstVal(tRowsPerStrip))
 		}
 
-		if blockHeight != 0 {
-			blocksDown = (d.config.Height + blockHeight - 1) / blockHeight
+		if l.blockHeight != 0 {
+			l.blocksDown = (d.config.Height + l.blockHeight - 1) / l.blockHeight
 		}
 
-		blockOffsets = d.features[tStripOffsets]
-		blockCounts = d.features[tStripByteCounts]
+		l.blockOffsets = d.features[tStripOffsets]
+		l.blockCounts = d.features[tStripByteCounts]
 	}
 
-	// Check if we have the right number of strips/tiles, offsets and counts.
-	if n := blocksAcross * blocksDown; len(blockOffsets) < n || len(blockCounts) < n {
-		return nil, FormatError("inconsistent header")
+	// Chunky data holds one block per spatial position. Planar data stores the
+	// sample planes one after another, so every position has one block per
+	// sample.
+	n := l.blocksAcross * l.blocksDown
+	if d.firstVal(tPlanarConfiguration) == pcPlanar {
+		n *= len(d.features[tBitsPerSample])
 	}
+	if len(l.blockOffsets) < n || len(l.blockCounts) < n {
+		return l, FormatError("inconsistent header")
+	}
+	return l, nil
+}
 
-	imgRect := image.Rect(0, 0, d.config.Width, d.config.Height)
+// newImage allocates an image of the decoder's color model with the given
+// bounds. No pixel data beyond rect is allocated.
+func (d *decoder) newImage(rect image.Rectangle) image.Image {
 	switch d.mode {
 	case mGray, mGrayInvert:
 		if d.bpp == 16 {
-			img = image.NewGray16(imgRect)
-		} else {
-			img = image.NewGray(imgRect)
+			return image.NewGray16(rect)
 		}
+		return image.NewGray(rect)
 	case mPaletted:
-		img = image.NewPaletted(imgRect, d.palette)
+		return image.NewPaletted(rect, d.palette)
 	case mNRGBA:
 		if d.bpp == 16 {
-			img = image.NewNRGBA64(imgRect)
-		} else {
-			img = image.NewNRGBA(imgRect)
+			return image.NewNRGBA64(rect)
 		}
+		return image.NewNRGBA(rect)
 	case mRGB, mRGBA:
 		if d.bpp == 16 {
-			img = image.NewRGBA64(imgRect)
-		} else {
-			img = image.NewRGBA(imgRect)
+			return image.NewRGBA64(rect)
 		}
+		return image.NewRGBA(rect)
 	}
+	return nil
+}
 
-	if blocksAcross == 0 || blocksDown == 0 {
-		return
+// bytesPerPixel reports how many bytes of output memory one pixel occupies.
+func (d *decoder) bytesPerPixel() int {
+	bps := int(d.bpp) / 8
+	if bps == 0 {
+		bps = 1
+	}
+	spp := len(d.features[tBitsPerSample])
+	// mRGB has no alpha sample in the file but is materialized as RGBA.
+	if d.mode == mRGB {
+		spp++
+	}
+	return bps * spp
+}
+
+// blockErr wraps err with the identity of the strip or tile (and, for planar
+// data, the sample plane) that triggered it.
+func (d *decoder) blockErr(l blockLayout, idx, plane int, err error) error {
+	kind := "strip"
+	if l.tile {
+		kind = "tile"
+	}
+	if d.firstVal(tPlanarConfiguration) == pcPlanar {
+		return fmt.Errorf("tiff: %s %d (sample plane %d): %w", kind, idx, plane, err)
+	}
+	return fmt.Errorf("tiff: %s %d: %w", kind, idx, err)
+}
+
+// readBlock reads and decompresses the block with the given layout index,
+// whose decoded dimensions are blkW by blkH. The returned slice is owned by
+// the decoder and is valid until the next readBlock call.
+func (d *decoder) readBlock(l blockLayout, idx, blkW, blkH int, blockMaxDataSize int64) ([]byte, error) {
+	offset := int64(l.blockOffsets[idx])
+	n := int64(l.blockCounts[idx])
+
+	var (
+		buf []byte
+		err error
+	)
+	switch d.firstVal(tCompression) {
+
+	// According to the spec, Compression does not have a default value,
+	// but some tools interpret a missing Compression value as none, so we do
+	// the same.
+	case cNone, 0:
+		if b, ok := d.r.(*buffer); ok {
+			buf, err = b.Slice(int(offset), int(n))
+		} else {
+			buf, err = safeReadAt(d.r, uint64(n), offset)
+		}
+	case cG3:
+		inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+		order := ccittFillOrder(d.firstVal(tFillOrder))
+		r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
+		buf, err = readBuf(r, d.buf, blockMaxDataSize)
+	case cG4:
+		inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+		order := ccittFillOrder(d.firstVal(tFillOrder))
+		r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
+		buf, err = readBuf(r, d.buf, blockMaxDataSize)
+	case cLZW:
+		r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), lzw.MSB, 8)
+		buf, err = readBuf(r, d.buf, blockMaxDataSize)
+		r.Close()
+	case cDeflate, cDeflateOld:
+		var r io.ReadCloser
+		r, err = zlib.NewReader(io.NewSectionReader(d.r, offset, n))
+		if err != nil {
+			return nil, err
+		}
+		buf, err = readBuf(r, d.buf, blockMaxDataSize)
+		r.Close()
+	case cPackBits:
+		buf, err = unpackBits(io.NewSectionReader(d.r, offset, n))
+	default:
+		err = UnsupportedError(fmt.Sprintf("compression value %d", d.firstVal(tCompression)))
+	}
+	return buf, err
+}
+
+// blockRect returns the image-space rectangle of the block at grid position
+// (i, j). Edge blocks are shrunk unless the layout uses padded tiles.
+func (d *decoder) blockRect(l blockLayout, i, j int) image.Rectangle {
+	blkW := l.blockWidth
+	if !l.blockPadding && i == l.blocksAcross-1 && d.config.Width%l.blockWidth != 0 {
+		blkW = d.config.Width % l.blockWidth
+	}
+	blkH := l.blockHeight
+	if !l.blockPadding && j == l.blocksDown-1 && d.config.Height%l.blockHeight != 0 {
+		blkH = d.config.Height % l.blockHeight
+	}
+	xmin := i * l.blockWidth
+	ymin := j * l.blockHeight
+	return image.Rect(xmin, ymin, xmin+blkW, ymin+blkH)
+}
+
+// decodeChunky decodes an image whose samples are stored interleaved. Only
+// blocks that overlap dst.Bounds() are read and decoded, so a sub-rectangle
+// decode never touches the pixel data of unrelated blocks.
+func (d *decoder) decodeChunky(dst image.Image, l blockLayout) error {
+	if l.blocksAcross == 0 || l.blocksDown == 0 {
+		return nil
 	}
 	// Maximum data per pixel is 8 bytes (RGBA64).
-	blockMaxDataSize := int64(blockWidth) * int64(blockHeight) * 8
-	for i := 0; i < blocksAcross; i++ {
-		blkW := blockWidth
-		if !blockPadding && i == blocksAcross-1 && d.config.Width%blockWidth != 0 {
-			blkW = d.config.Width % blockWidth
-		}
-		for j := 0; j < blocksDown; j++ {
-			blkH := blockHeight
-			if !blockPadding && j == blocksDown-1 && d.config.Height%blockHeight != 0 {
-				blkH = d.config.Height % blockHeight
+	blockMaxDataSize := int64(l.blockWidth) * int64(l.blockHeight) * 8
+	for i := 0; i < l.blocksAcross; i++ {
+		for j := 0; j < l.blocksDown; j++ {
+			blk := d.blockRect(l, i, j)
+			if !blk.Overlaps(dst.Bounds()) {
+				continue
 			}
-			offset := int64(blockOffsets[j*blocksAcross+i])
-			n := int64(blockCounts[j*blocksAcross+i])
-			switch d.firstVal(tCompression) {
-
-			// According to the spec, Compression does not have a default value,
-			// but some tools interpret a missing Compression value as none, so we do
-			// the same.
-			case cNone, 0:
-				if b, ok := d.r.(*buffer); ok {
-					d.buf, err = b.Slice(int(offset), int(n))
-				} else {
-					d.buf, err = safeReadAt(d.r, uint64(n), offset)
-				}
-			case cG3:
-				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
-				order := ccittFillOrder(d.firstVal(tFillOrder))
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-			case cG4:
-				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
-				order := ccittFillOrder(d.firstVal(tFillOrder))
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-			case cLZW:
-				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), lzw.MSB, 8)
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-				r.Close()
-			case cDeflate, cDeflateOld:
-				var r io.ReadCloser
-				r, err = zlib.NewReader(io.NewSectionReader(d.r, offset, n))
-				if err != nil {
-					return nil, err
-				}
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-				r.Close()
-			case cPackBits:
-				d.buf, err = unpackBits(io.NewSectionReader(d.r, offset, n))
-			default:
-				err = UnsupportedError(fmt.Sprintf("compression value %d", d.firstVal(tCompression)))
-			}
+			idx := j*l.blocksAcross + i
+			buf, err := d.readBlock(l, idx, blk.Dx(), blk.Dy(), blockMaxDataSize)
 			if err != nil {
-				return nil, err
+				return d.blockErr(l, idx, 0, err)
 			}
-
-			xmin := i * blockWidth
-			ymin := j * blockHeight
-			xmax := xmin + blkW
-			ymax := ymin + blkH
-			err = d.decode(img, xmin, ymin, xmax, ymax)
-			if err != nil {
-				return nil, err
+			d.buf = buf
+			if err := d.decode(dst, blk.Min.X, blk.Min.Y, blk.Max.X, blk.Max.Y); err != nil {
+				return d.blockErr(l, idx, 0, err)
 			}
 		}
 	}
-	return
+	return nil
+}
+
+// pixOffseter is satisfied by every dense image type produced by newImage.
+type pixOffseter interface {
+	PixOffset(x, y int) int
+}
+
+// undoPlanarPredictor reverses the horizontal differencing predictor on one
+// block of planar data, where every pixel of the block holds a single sample
+// of d.bpp bits.
+func (d *decoder) undoPlanarPredictor(blkW, blkH int) error {
+	bps := int(d.bpp) / 8 // bytes per sample: 1 or 2
+	for y := 0; y < blkH; y++ {
+		row := y * blkW * bps
+		for x := 1; x < blkW; x++ {
+			off := row + x*bps
+			if off+bps > len(d.buf) {
+				return errNoPixels
+			}
+			if bps == 2 {
+				prev := d.byteOrder.Uint16(d.buf[off-2 : off])
+				cur := d.byteOrder.Uint16(d.buf[off : off+2])
+				d.byteOrder.PutUint16(d.buf[off:off+2], prev+cur)
+			} else {
+				d.buf[off] += d.buf[off-1]
+			}
+		}
+	}
+	return nil
+}
+
+// decodePlanar decodes an image whose samples are stored in separate planes.
+// Only blocks that overlap dst.Bounds() are read.
+func (d *decoder) decodePlanar(dst image.Image, l blockLayout) error {
+	if l.blocksAcross == 0 || l.blocksDown == 0 {
+		return nil
+	}
+	spp := len(d.features[tBitsPerSample])
+	spatial := l.blocksAcross * l.blocksDown
+	// Maximum data per pixel is 8 bytes (RGBA64).
+	blockMaxDataSize := int64(l.blockWidth) * int64(l.blockHeight) * 8
+	bps := int(d.bpp) / 8 // bytes per sample: 1 or 2
+	bounds := dst.Bounds()
+
+	po, ok := dst.(pixOffseter)
+	if !ok {
+		return UnsupportedError("color model")
+	}
+	var pix []byte
+	switch p := dst.(type) {
+	case *image.RGBA:
+		pix = p.Pix
+	case *image.NRGBA:
+		pix = p.Pix
+	case *image.RGBA64:
+		pix = p.Pix
+	case *image.NRGBA64:
+		pix = p.Pix
+	default:
+		return UnsupportedError("color model")
+	}
+
+	// RGB data has no alpha plane: fill the alpha channel with full opacity.
+	if d.mode == mRGB {
+		alpha := uint8(0xff)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				pix[po.PixOffset(x, y)+spp*bps] = alpha
+				if bps == 2 {
+					pix[po.PixOffset(x, y)+spp*bps+1] = alpha
+				}
+			}
+		}
+	}
+
+	for plane := 0; plane < spp; plane++ {
+		for i := 0; i < l.blocksAcross; i++ {
+			for j := 0; j < l.blocksDown; j++ {
+				blk := d.blockRect(l, i, j)
+				if !blk.Overlaps(bounds) {
+					continue
+				}
+				spatialIdx := j*l.blocksAcross + i
+				idx := plane*spatial + spatialIdx
+				buf, err := d.readBlock(l, idx, blk.Dx(), blk.Dy(), blockMaxDataSize)
+				if err != nil {
+					return d.blockErr(l, spatialIdx, plane, err)
+				}
+				d.buf = buf
+				if d.firstVal(tPredictor) == prHorizontal {
+					if err := d.undoPlanarPredictor(blk.Dx(), blk.Dy()); err != nil {
+						return d.blockErr(l, spatialIdx, plane, err)
+					}
+				}
+				for y := maxInt(blk.Min.Y, bounds.Min.Y); y < minInt(blk.Max.Y, bounds.Max.Y); y++ {
+					for x := maxInt(blk.Min.X, bounds.Min.X); x < minInt(blk.Max.X, bounds.Max.X); x++ {
+						src := ((y-blk.Min.Y)*blk.Dx() + (x - blk.Min.X)) * bps
+						if src+bps > len(d.buf) {
+							return d.blockErr(l, spatialIdx, plane, errNoPixels)
+						}
+						dstOff := po.PixOffset(x, y) + plane*bps
+						pix[dstOff] = d.buf[src]
+						if bps == 2 {
+							pix[dstOff+1] = d.buf[src+1]
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Decode reads a TIFF image from r and returns it as an image.Image.
+// The type of Image returned depends on the contents of the TIFF.
+func Decode(r io.Reader) (img image.Image, err error) {
+	d, err := newDecoder(newReaderAt(r))
+	if err != nil {
+		return nil, err
+	}
+	l, err := d.layout()
+	if err != nil {
+		return nil, err
+	}
+
+	imgRect := image.Rect(0, 0, d.config.Width, d.config.Height)
+	img = d.newImage(imgRect)
+	if l.blocksAcross == 0 || l.blocksDown == 0 {
+		return img, nil
+	}
+	if d.firstVal(tPlanarConfiguration) == pcPlanar {
+		err = d.decodePlanar(img, l)
+	} else {
+		err = d.decodeChunky(img, l)
+	}
+	return img, err
+}
+
+// maxRegionBytes caps the pixel memory that a single DecodeRegion call may
+// allocate. The dimensions of the rectangle and of the image both originate
+// from untrusted metadata, so the check runs before any pixel allocation.
+const maxRegionBytes = 256 << 20 // 256 MiB
+
+// DecodeRegion reads the pixels inside rect from a TIFF image in r and returns
+// them as an image.Image. Only the strips or tiles intersecting rect are read
+// and decoded, and the returned image's Bounds equal the intersection of rect
+// with the image bounds; no memory is allocated for pixels outside of it.
+//
+// Because the data of each strip or tile is accessed at arbitrary file
+// offsets, r must be an io.ReaderAt; the same reader can be used for repeated
+// DecodeRegion calls. A rectangle with negative width or height, an empty
+// rectangle, or one that does not overlap the image results in a FormatError.
+func DecodeRegion(r io.ReaderAt, rect image.Rectangle) (image.Image, error) {
+	if rect.Empty() {
+		return nil, FormatError("empty source rectangle")
+	}
+	d, err := newDecoder(r)
+	if err != nil {
+		return nil, err
+	}
+	l, err := d.layout()
+	if err != nil {
+		return nil, err
+	}
+
+	imgBounds := image.Rect(0, 0, d.config.Width, d.config.Height)
+	out := rect.Intersect(imgBounds)
+	if out.Empty() {
+		return nil, FormatError("source rectangle does not overlap the image")
+	}
+
+	// Enforce the resource limit before allocating the destination image.
+	if int64(out.Dx()) > maxRegionBytes/int64(d.bytesPerPixel()) ||
+		int64(out.Dy()) > maxRegionBytes/int64(d.bytesPerPixel()) ||
+		int64(out.Dx())*int64(out.Dy())*int64(d.bytesPerPixel()) > maxRegionBytes {
+		return nil, FormatError("decoded region is too large")
+	}
+
+	img := d.newImage(out)
+	if d.firstVal(tPlanarConfiguration) == pcPlanar {
+		err = d.decodePlanar(img, l)
+	} else {
+		err = d.decodeChunky(img, l)
+	}
+	return img, err
 }
 
 func readBuf(r io.Reader, buf []byte, lim int64) ([]byte, error) {

@@ -44,6 +44,8 @@ const (
 
 	tFillOrder = 266
 
+	tPlanarConfiguration = 284
+
 	tStripOffsets    = 273
 	tSamplesPerPixel = 277
 	tRowsPerStrip    = 278
@@ -97,6 +99,12 @@ const (
 const (
 	prNone       = 1
 	prHorizontal = 2
+)
+
+// Values for the tPlanarConfiguration tag (page 39 of the spec).
+const (
+	pcChunky = 1
+	pcPlanar = 2
 )
 
 // Values for the tResolutionUnit tag (page 18).
